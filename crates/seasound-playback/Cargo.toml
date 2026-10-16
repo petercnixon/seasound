@@ -1,0 +1,17 @@
+[package]
+name = "seasound-playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Gapless playback scheduler and audio output for SeaSound"
+
+[dependencies]
+seasound-model.workspace = true
+rubato = { version = "0.16", default-features = false }
+rtrb = "0.3"
+cpal = { version = "0.15", optional = true }
+
+[features]
+default = ["cpal-output"]
+cpal-output = ["dep:cpal"]

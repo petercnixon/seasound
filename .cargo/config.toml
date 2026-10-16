@@ -1,0 +1,4 @@
+# Stay on crate versions this compiler can build. Several GUI dependencies
+# publish releases that need a newer rustc than the one this workspace uses.
+[resolver]
+incompatible-rust-versions = "fallback"

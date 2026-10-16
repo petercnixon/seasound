@@ -1,0 +1,18 @@
+[package]
+name = "seasound-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Playlist window for SeaSound"
+
+[dependencies]
+seasound-model.workspace = true
+seasound-media.workspace = true
+seasound-playback.workspace = true
+eframe = "0.31"
+rfd = "0.15"
+image = { version = "=0.25.9", default-features = false, features = ["jpeg", "png", "bmp"] }
+directories = "5"
+serde.workspace = true
+serde_json.workspace = true

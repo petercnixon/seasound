@@ -1,0 +1,17 @@
+[package]
+name = "seasound-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "File probing, cue sheets, chapters, and decoding for SeaSound"
+
+[dependencies]
+seasound-model.workspace = true
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac", "aiff"] }
+lofty = "0.21"
+mp4ameta = "0.13"
+encoding_rs = "=0.8.35"
+
+[dev-dependencies]
+serde_json = "1"
