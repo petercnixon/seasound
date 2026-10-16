@@ -3142,6 +3142,7 @@ dependencies = [
  "seasound-playback",
  "serde",
  "serde_json",
+ "winit",
 ]
 
 [[package]]

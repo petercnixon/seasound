@@ -772,7 +772,7 @@ mod tests {
         for source in &playable {
             assert_eq!(source.format, AudioFormat::Mp3, "{}", source.path.display());
             assert_eq!(source.segments.len(), 1, "{}", source.path.display());
-            assert_eq!(source.delay, 576, "{}", source.path.display());
+            assert_eq!(source.delay, 1105, "{}", source.path.display());
             assert!(source.padding > 0, "{}", source.path.display());
             assert!(source.presentation_frames > source.sample_rate as u64);
             assert!(!source.title.is_empty(), "{}", source.path.display());

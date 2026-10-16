@@ -344,7 +344,7 @@ mod tests {
         }
         let info = read_mp3_info(&path);
         let delay = info.trim.delay;
-        assert_eq!(delay, 576, "the example album is LAME with a 576-frame delay");
+        assert_eq!(delay, 1105, "LAME delay 576 plus the 529-sample decoder delay");
         let count = 2048u64;
         let mut raw = open_decoder(
             &path,
@@ -401,4 +401,147 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn gapless_mp3_matches_ffmpeg_sample_window() {
+        let album = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/Gapless MP3 Album");
+        let first = album.join("101. Fatboy Slim - Gangster Trippin'.mp3");
+        let second = album.join("102. Dub Pistols - Cyclone (Stretch & Vern's Punks Jump Up Mix).mp3");
+        if !first.is_file() || !second.is_file() {
+            return;
+        }
+        let info = read_mp3_info(&first);
+        let decoded = info.decoded_frames.expect("xing frames");
+        let presentation = info.trim.presentation(Some(decoded));
+        assert_eq!(info.trim.delay, 1105);
+        assert_eq!(info.trim.padding, 1031);
+        assert_eq!(decoded, 8_816_256);
+        assert_eq!(presentation, 8_814_120);
+
+        let head = ffmpeg_f32le(&[
+            "-i",
+            first.to_str().unwrap(),
+            "-t",
+            "0.5",
+            "-f",
+            "f32le",
+            "-ac",
+            "2",
+            "pipe:1",
+        ]);
+        let Some(head) = head else {
+            return;
+        };
+        // A timestamp seek is not sample-accurate here. Decode straight through.
+        let decoded = pull_frames(&first, info.trim.delay, info.trim.padding, presentation, 0);
+        assert_eq!(decoded.len(), presentation as usize * 2, "presentation samples");
+        let head_frames = head.len() / 2;
+        assert!(head_frames >= 22050, "ffmpeg head frames {head_frames}");
+        let head_diff = max_abs_diff(&decoded[..head.len()], &head);
+        assert!(
+            head_diff < 1e-4,
+            "first 0.5 s differs from ffmpeg by {head_diff}"
+        );
+
+        let tail = 2048usize;
+        let start = presentation as usize - tail;
+        let filter = format!(
+            "atrim=start_sample={}:end_sample={presentation},asetpts=PTS-STARTPTS",
+            start
+        );
+        let tail_ref = ffmpeg_f32le(&[
+            "-i",
+            first.to_str().unwrap(),
+            "-af",
+            &filter,
+            "-f",
+            "f32le",
+            "-ac",
+            "2",
+            "pipe:1",
+        ])
+        .expect("ffmpeg is installed");
+        let decoded_tail = &decoded[start * 2..];
+        let compared = decoded_tail.len().min(tail_ref.len());
+        assert!(compared >= (tail - 1) * 2, "tail samples {compared}");
+        let tail_diff = max_abs_diff(&decoded_tail[..compared], &tail_ref[..compared]);
+        assert!(
+            tail_diff < 1e-4,
+            "tail differs from ffmpeg atrim by {tail_diff}"
+        );
+
+        let next = read_mp3_info(&second);
+        assert_eq!(next.trim.delay, 1105);
+        let shifted_last = *decoded.iter().step_by(2).last().unwrap();
+        let shifted_first = pull_frames(&second, next.trim.delay, next.trim.padding, 1, 0)[0];
+        let shifted = (shifted_last - shifted_first).abs();
+        // The unshifted window is the same length, starting 529 samples earlier.
+        let raw_index = presentation as usize - 529 - 1;
+        let raw_last = decoded[raw_index * 2];
+        let raw_first = pull_frames(&second, next.trim.delay - 529, next.trim.padding + 529, 1, 0)[0];
+        let raw = (raw_last - raw_first).abs();
+        assert!(
+            shifted < raw,
+            "shifted boundary {shifted} is not quieter than the unshifted boundary {raw}"
+        );
+    }
+
+    fn ffmpeg_f32le(args: &[&str]) -> Option<Vec<f32>> {
+        let mut command = std::process::Command::new("ffmpeg");
+        command.arg("-v").arg("error");
+        command.args(args);
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) => panic!("ffmpeg: {err}"),
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(
+            output
+                .stdout
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .collect(),
+        )
+    }
+
+    fn pull_frames(path: &std::path::Path, delay: u64, padding: u64, presentation: u64, from: u64) -> Vec<f32> {
+        let mut decoder = open_decoder(
+            path,
+            DecodeParams {
+                delay,
+                padding,
+                presentation_frames: presentation,
+            },
+        )
+        .expect("decoder");
+        if from > 0 {
+            decoder.seek_presentation(from).expect("seek");
+        }
+        let channels = decoder.channels() as usize;
+        let frames = presentation.saturating_sub(from) as usize;
+        let mut buf = vec![0f32; frames * channels];
+        let mut got = 0usize;
+        while got < frames {
+            let n = decoder.pull(&mut buf[got * channels..]).expect("pull");
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        buf.truncate(got * channels);
+        buf
+    }
+
+    fn max_abs_diff(left: &[f32], right: &[f32]) -> f32 {
+        left.iter()
+            .zip(right)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
 }

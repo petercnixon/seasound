@@ -99,11 +99,30 @@ pub fn read_mp3_info(path: &Path) -> Mp3Info {
     finish_mp3(&full, Trim::none())
 }
 
+/// Samples an ISO MP3 decoder inserts before the first audible sample.
+///
+/// LAME's delay field does not include the 528-sample filterbank delay, and LAME and
+/// ffmpeg count one sample more. Playback therefore skips `tag delay + 529` and drops
+/// 529 samples fewer at the end, which keeps the audible length. AAC priming is already
+/// an absolute count and must not be shifted. A tag with both fields at zero is not LAME.
+const MP3_DECODER_DELAY: u64 = 529;
+
+fn shift_mp3_decoder_delay(trim: Trim) -> Trim {
+    if trim.delay == 0 && trim.padding == 0 {
+        return trim;
+    }
+    Trim {
+        delay: trim.delay.saturating_add(MP3_DECODER_DELAY),
+        padding: trim.padding.saturating_sub(MP3_DECODER_DELAY),
+        valid: trim.valid,
+    }
+}
+
 fn finish_mp3(audio: &[u8], id3_trim: Trim) -> Mp3Info {
     let lame = parse_mp3_frame(audio);
-    let trim = if lame.trim.delay > 0 || lame.trim.padding > 0 {
-        // LAME describes this encode. Prefer it over an ID3 comment when both exist
-        // and the comment does not carry a sample count that matches the frame header.
+    if lame.trim.delay > 0 || lame.trim.padding > 0 {
+        // LAME describes this encode. Prefer an iTunSMPB comment only when the LAME
+        // delay is absent and the comment's three counts match the frame header.
         if let Some(valid) = id3_trim.valid {
             if let Some(decoded) = lame.decoded_frames {
                 let from_id3 = id3_trim.delay + valid + id3_trim.padding;
@@ -116,8 +135,13 @@ fn finish_mp3(audio: &[u8], id3_trim: Trim) -> Mp3Info {
                 }
             }
         }
-        lame.trim
-    } else if id3_trim.delay > 0 || id3_trim.padding > 0 || id3_trim.valid.is_some() {
+        return Mp3Info {
+            trim: shift_mp3_decoder_delay(lame.trim),
+            decoded_frames: lame.decoded_frames,
+            sample_rate: lame.sample_rate,
+        };
+    }
+    let trim = if id3_trim.delay > 0 || id3_trim.padding > 0 || id3_trim.valid.is_some() {
         id3_trim
     } else {
         Trim::none()
@@ -588,5 +612,22 @@ mod tests {
         let chosen = choose_trim(Some(lame), None, None, Some(100_000));
         assert_eq!(chosen.delay, 576);
         assert_eq!(chosen.presentation(Some(100_000)), 100_000 - 576 - 1560);
+    }
+
+    #[test]
+    fn playback_shifts_lame_delay_by_the_decoder_delay() {
+        let raw = Trim {
+            delay: 576,
+            padding: 1560,
+            valid: None,
+        };
+        let shifted = shift_mp3_decoder_delay(raw);
+        assert_eq!(shifted.delay, 1105);
+        assert_eq!(shifted.padding, 1031);
+        assert_eq!(shifted.valid, None);
+        // 576 + 1560 == 1105 + 1031, so the audible length is unchanged.
+        assert_eq!(shifted.presentation(Some(8_816_256)), 8_814_120);
+        assert_eq!(raw.presentation(Some(8_816_256)), shifted.presentation(Some(8_816_256)));
+        assert_eq!(shift_mp3_decoder_delay(Trim::none()), Trim::none());
     }
 }

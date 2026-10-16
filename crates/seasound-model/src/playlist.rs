@@ -127,6 +127,34 @@ impl Playlist {
         Some(self.entries.remove(index))
     }
 
+    /// Move the chosen rows together, preserving their order, so the block sits in front of
+    /// `insert_before`. `insert_before == len` appends. Returns the block's new indices, or
+    /// `None` when the order would not change.
+    pub fn move_rows(&mut self, indices: &[usize], insert_before: usize) -> Option<Vec<usize>> {
+        let order = plan_row_move(self.entries.len(), indices, insert_before)?;
+        let chosen = row_membership(self.entries.len(), indices);
+        let places = places_of(&order, &chosen);
+        let old = std::mem::take(&mut self.entries);
+        self.entries = order.into_iter().map(|index| old[index].clone()).collect();
+        Some(places)
+    }
+
+    /// Where `move_rows` would put the chosen rows. The playlist is left unchanged.
+    pub fn moved_places(len: usize, indices: &[usize], insert_before: usize) -> Option<Vec<usize>> {
+        let order = plan_row_move(len, indices, insert_before)?;
+        Some(places_of(&order, &row_membership(len, indices)))
+    }
+
+    pub fn remove_indices(&mut self, indices: &[usize]) {
+        let chosen = row_membership(self.entries.len(), indices);
+        let mut index = 0;
+        self.entries.retain(|_| {
+            let drop = chosen.get(index).copied().unwrap_or(false);
+            index += 1;
+            !drop
+        });
+    }
+
     /// Remember rows by path and start frame so a later probe can find them again.
     pub fn to_saved(&self) -> SavedPlaylist {
         let mut rows = Vec::new();
@@ -145,6 +173,49 @@ impl Playlist {
         }
         SavedPlaylist { version: 1, rows }
     }
+}
+
+fn row_membership(len: usize, indices: &[usize]) -> Vec<bool> {
+    let mut chosen = vec![false; len];
+    for index in indices {
+        if *index < len {
+            chosen[*index] = true;
+        }
+    }
+    chosen
+}
+
+/// Old indices in the order they appear after the move.
+fn plan_row_move(len: usize, indices: &[usize], insert_before: usize) -> Option<Vec<usize>> {
+    if len == 0 {
+        return None;
+    }
+    let chosen = row_membership(len, indices);
+    if !chosen.iter().any(|flag| *flag) {
+        return None;
+    }
+    let moving: Vec<usize> = (0..len).filter(|index| chosen[*index]).collect();
+    let rest: Vec<usize> = (0..len).filter(|index| !chosen[*index]).collect();
+    let insert_before = insert_before.min(len);
+    let dest = rest.iter().take_while(|index| **index < insert_before).count();
+    let mut order = Vec::with_capacity(len);
+    order.extend_from_slice(&rest[..dest]);
+    order.extend_from_slice(&moving);
+    order.extend_from_slice(&rest[dest..]);
+    let identity: Vec<usize> = (0..len).collect();
+    if order == identity {
+        None
+    } else {
+        Some(order)
+    }
+}
+
+fn places_of(order: &[usize], chosen: &[bool]) -> Vec<usize> {
+    order
+        .iter()
+        .enumerate()
+        .filter_map(|(new_index, old_index)| chosen[*old_index].then_some(new_index))
+        .collect()
 }
 
 fn entries_for(sources: &[Source]) -> Vec<PlaylistEntry> {
@@ -540,6 +611,45 @@ mod tests {
         playlist.reorder(0, 2);
         let segments: Vec<_> = playlist.entries.iter().map(|entry| entry.segment).collect();
         assert_eq!(segments, vec![1, 2, 0]);
+    }
+
+    fn numbered(len: usize) -> Playlist {
+        let mut playlist = Playlist::empty();
+        playlist.entries = (0..len)
+            .map(|segment| PlaylistEntry {
+                source_id: SourceId(1),
+                segment,
+            })
+            .collect();
+        playlist
+    }
+
+    fn segments_of(playlist: &Playlist) -> Vec<usize> {
+        playlist.entries.iter().map(|entry| entry.segment).collect()
+    }
+
+    #[test]
+    fn move_rows_keeps_relative_order_and_skips_a_noop() {
+        let mut playlist = numbered(5);
+        assert!(playlist.move_rows(&[1, 2], 3).is_none());
+        assert!(Playlist::moved_places(5, &[1, 2], 1).is_none());
+        let places = playlist.move_rows(&[1, 2], 4).unwrap();
+        assert_eq!(segments_of(&playlist), vec![0, 3, 1, 2, 4]);
+        assert_eq!(places, vec![2, 3]);
+        let places = playlist.move_rows(&[0, 2], 5).unwrap();
+        assert_eq!(segments_of(&playlist), vec![3, 2, 4, 0, 1]);
+        assert_eq!(places, vec![3, 4]);
+        assert!(playlist.move_rows(&[], 0).is_none());
+        assert!(playlist.move_rows(&[9], 0).is_none());
+    }
+
+    #[test]
+    fn remove_indices_drops_every_listed_row() {
+        let mut playlist = numbered(5);
+        playlist.remove_indices(&[0, 2, 2, 9]);
+        assert_eq!(segments_of(&playlist), vec![1, 3, 4]);
+        playlist.remove_indices(&[]);
+        assert_eq!(segments_of(&playlist), vec![1, 3, 4]);
     }
 
     #[test]

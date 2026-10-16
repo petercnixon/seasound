@@ -16,3 +16,6 @@ image = { version = "=0.25.9", default-features = false, features = ["jpeg", "pn
 directories = "5"
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android", target_os = "redox"))))'.dependencies]
+winit = { version = "0.30.13", default-features = false, features = ["x11"] }

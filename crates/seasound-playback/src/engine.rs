@@ -76,7 +76,11 @@ pub enum Command {
     SetRepeat(Repeat),
     SetShuffle(bool),
     Reorder { from: usize, to: usize },
+    /// Move these rows, as a block, to sit in front of `insert_before`.
+    MoveRows { indices: Vec<usize>, insert_before: usize },
     Remove(usize),
+    /// Remove every listed row. Deleting the current row starts the next one that remains.
+    RemoveMany(Vec<usize>),
     SetDevice(Option<String>),
     Shutdown,
 }
@@ -338,6 +342,19 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
             }
             deck.refresh_rows();
         }
+        Command::MoveRows { indices, insert_before } => {
+            let current = deck.current_entry();
+            if deck.playlist.move_rows(&indices, insert_before).is_some() {
+                deck.cursor.set_len(deck.playlist.entries.len());
+                if let Some(entry) = current {
+                    if let Some(index) = deck.playlist.entries.iter().position(|item| item == &entry) {
+                        deck.cursor.set_index(Some(index));
+                        deck.display_index = Some(index);
+                    }
+                }
+                deck.refresh_rows();
+            }
+        }
         Command::Remove(index) => {
             let current = deck.current_entry();
             let removed_current = deck.cursor.index() == Some(index);
@@ -360,6 +377,54 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
             } else if let Some(entry) = current {
                 if let Some(index) = deck.playlist.entries.iter().position(|item| item == &entry) {
                     deck.cursor.set_index(Some(index));
+                }
+            }
+        }
+        Command::RemoveMany(indices) => {
+            let current = deck.current_entry();
+            let len = deck.playlist.entries.len();
+            let mut chosen = vec![false; len];
+            for index in &indices {
+                if *index < len {
+                    chosen[*index] = true;
+                }
+            }
+            let cursor_index = deck.cursor.index();
+            let removed_current = match cursor_index {
+                Some(index) => chosen.get(index).copied().unwrap_or(false),
+                None => false,
+            };
+            let next = if removed_current {
+                cursor_index.and_then(|current_index| {
+                    let mut candidate = current_index + 1;
+                    while candidate < len {
+                        if !chosen[candidate] {
+                            let removed_before = chosen[..candidate].iter().filter(|flag| **flag).count();
+                            return Some(candidate - removed_before);
+                        }
+                        candidate += 1;
+                    }
+                    None
+                })
+            } else {
+                None
+            };
+            deck.playlist.remove_indices(&indices);
+            deck.cursor.set_len(deck.playlist.entries.len());
+            deck.refresh_rows();
+            if removed_current {
+                if let Some(index) = next.filter(|index| deck.playable(*index)) {
+                    deck.begin(index, output);
+                } else if let Some(index) = deck.first_playable() {
+                    deck.begin(index, output);
+                } else {
+                    deck.cursor.set_index(None);
+                    deck.halt(output);
+                }
+            } else if let Some(entry) = current {
+                if let Some(index) = deck.playlist.entries.iter().position(|item| item == &entry) {
+                    deck.cursor.set_index(Some(index));
+                    deck.display_index = Some(index);
                 }
             }
         }
@@ -1031,6 +1096,105 @@ mod tests {
         let snapshot = engine.snapshot();
         assert!(snapshot.rows.is_empty());
         assert_eq!(snapshot.state, PlayState::Stopped);
+    }
+
+    #[test]
+    fn moving_rows_keeps_the_current_file_and_removing_it_starts_the_next() {
+        let opens = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counted = std::sync::Arc::clone(&opens);
+        let opener: Opener = std::sync::Arc::new(move |source| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let memory = MemoryOutput::new(44100);
+        let engine = Engine::start_with(opener, Box::new(memory));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![
+                source("a.flac", u64::MAX / 4),
+                source("b.flac", u64::MAX / 4),
+                source("c.flac", u64::MAX / 4),
+            ]),
+            autoplay: true,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot.state == PlayState::Playing && snapshot.title == "a.flac" {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("playback did not start: {:?}", snapshot.state);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        // The next file may be prefetched. Wait until that open has landed.
+        let mut opened = opens.load(std::sync::atomic::Ordering::SeqCst);
+        let mut stable = 0u8;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            thread::sleep(Duration::from_millis(10));
+            let now = opens.load(std::sync::atomic::Ordering::SeqCst);
+            if now == opened {
+                stable += 1;
+                if stable >= 3 {
+                    break;
+                }
+            } else {
+                opened = now;
+                stable = 0;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        engine.command(Command::MoveRows {
+            indices: vec![2],
+            insert_before: 0,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let titles: Vec<_> = snapshot.rows.iter().map(|row| row.title.as_str()).collect();
+            if titles == ["c.flac", "a.flac", "b.flac"]
+                && snapshot.title == "a.flac"
+                && snapshot.index == Some(1)
+                && snapshot.state == PlayState::Playing
+            {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "move did not stick: {:?} index {:?} title {} rows {titles:?}",
+                    snapshot.state, snapshot.index, snapshot.title
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), opened);
+        engine.command(Command::RemoveMany(vec![1]));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let titles: Vec<_> = snapshot.rows.iter().map(|row| row.title.as_str()).collect();
+            if titles == ["c.flac", "b.flac"]
+                && snapshot.title == "b.flac"
+                && snapshot.index == Some(1)
+                && snapshot.state == PlayState::Playing
+            {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "remove did not start the next row: {:?} index {:?} title {} rows {titles:?}",
+                    snapshot.state, snapshot.index, snapshot.title
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Output that reports playback a fixed number of frames behind what was pushed.

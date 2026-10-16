@@ -17,6 +17,7 @@ use seasound_playback::{Command, Engine, Opener, Snapshot};
 use serde::{Deserialize, Serialize};
 
 const ROW_H: f32 = 28.0;
+const DRAG_SLOP: f32 = 8.0;
 const AUDIO_EXT: &[&str] = &[
     "mp3", "flac", "m4a", "m4b", "mp4", "wav", "aiff", "aif", "ogg", "cue", "m3u", "m3u8",
 ];
@@ -33,9 +34,8 @@ pub struct SeaSoundApp {
     muted: bool,
     seek: f32,
     seek_drag: bool,
-    selected: Option<usize>,
-    drag_from: Option<usize>,
-    drag_travel: f32,
+    selected: HashSet<usize>,
+    row_drag: Option<RowDrag>,
     covers: HashMap<SourceId, Cover>,
     warnings: HashMap<SourceId, String>,
     textures: HashMap<SourceId, egui::TextureHandle>,
@@ -81,9 +81,46 @@ enum LoadDone {
     Failed(String),
 }
 
+#[derive(Clone)]
 enum Line {
     Header(String),
     Track(usize),
+}
+
+#[derive(Clone, Copy)]
+enum RowGesture {
+    /// `anchor` is a position in the row slice. `pressed` is the playlist entry index.
+    Select { anchor: usize, pressed: usize },
+    /// `pressed` is the playlist entry index.
+    Move { pressed: usize },
+}
+
+#[derive(Clone, Copy)]
+struct RowDrag {
+    gesture: RowGesture,
+    travel: f32,
+    insert_before: Option<usize>,
+}
+
+struct Slot {
+    line: Line,
+    rect: egui::Rect,
+    response: egui::Response,
+}
+
+/// One visible track, in playlist order. Geometry helpers take this instead of egui widgets.
+#[derive(Clone, Copy)]
+struct TrackSpan {
+    index: usize,
+    position: usize,
+    top: f32,
+    bottom: f32,
+}
+
+impl TrackSpan {
+    fn center(self) -> f32 {
+        (self.top + self.bottom) * 0.5
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -140,9 +177,8 @@ impl SeaSoundApp {
             muted: settings.muted,
             seek: 0.0,
             seek_drag: false,
-            selected: None,
-            drag_from: None,
-            drag_travel: 0.0,
+            selected: HashSet::new(),
+            row_drag: None,
             covers: HashMap::new(),
             warnings: HashMap::new(),
             textures: HashMap::new(),
@@ -225,14 +261,17 @@ impl SeaSoundApp {
         self.warnings.clear();
         self.textures.clear();
         self.cover_failed.clear();
-        self.selected = None;
-        self.drag_from = None;
-        self.drag_travel = 0.0;
+        self.forget_selection();
         self.seek = 0.0;
         self.seek_drag = false;
         self.last_followed = None;
         self.notice = None;
         self.settle = 15;
+    }
+
+    fn forget_selection(&mut self) {
+        self.selected.clear();
+        self.row_drag = None;
     }
 
     fn install_playlist(&mut self, mut playlist: Playlist, autoplay: bool, path: Option<PathBuf>) {
@@ -246,9 +285,7 @@ impl SeaSoundApp {
         self.warnings = warnings;
         self.textures.clear();
         self.cover_failed.clear();
-        self.selected = None;
-        self.drag_from = None;
-        self.drag_travel = 0.0;
+        self.forget_selection();
         self.seek = 0.0;
         self.seek_drag = false;
         self.last_followed = None;
@@ -291,12 +328,13 @@ impl SeaSoundApp {
         if consume(ctx, egui::Key::ArrowDown) {
             self.nudge_volume(-0.05);
         }
-        if consume(ctx, egui::Key::Delete) {
-            if let Some(index) = self.selected {
-                self.engine.command(Command::Remove(index));
-                self.selected = None;
-                self.settle = 15;
-            }
+        if consume(ctx, egui::Key::Delete) && !self.selected.is_empty() {
+            let mut indices: Vec<usize> = self.selected.iter().copied().collect();
+            indices.sort_unstable();
+            self.engine.command(Command::RemoveMany(indices));
+            self.selected.clear();
+            self.row_drag = None;
+            self.settle = 15;
         }
     }
 
@@ -643,6 +681,9 @@ impl SeaSoundApp {
         let rows = std::sync::Arc::clone(&self.snap.rows);
         let playing = self.snap.index;
         let hovering = ctx.input(|input| !input.raw.hovered_files.is_empty());
+        if rows.is_empty() {
+            self.forget_selection();
+        }
         if playing != self.last_followed {
             self.last_followed = playing;
             let lines = playlist_lines(&rows);
@@ -679,36 +720,175 @@ impl SeaSoundApp {
             ui.separator();
             ui.spacing_mut().item_spacing.y = 0.0;
             let lines = playlist_lines(&rows);
-            let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            let mut scroll = egui::ScrollArea::vertical()
+                .id_salt("playlist")
+                .auto_shrink([false, false])
+                .drag_to_scroll(false);
             if let Some(offset) = self.pending_scroll.take() {
                 scroll = scroll.vertical_scroll_offset(offset);
             }
-            let mut rects = Vec::new();
-            scroll.show_rows(ui, ROW_H, lines.len(), |ui, range| {
+            let output = scroll.show_rows(ui, ROW_H, lines.len(), |ui, range| {
+                let mut slots = Vec::with_capacity(range.len());
                 for line_i in range {
-                    self.paint_line(ui, &rows, &lines[line_i], playing, &mut rects);
+                    let width = ui.available_width();
+                    let sense = match &lines[line_i] {
+                        Line::Header(_) => egui::Sense::hover(),
+                        Line::Track(_) => egui::Sense::click(),
+                    };
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, ROW_H), sense);
+                    slots.push(Slot {
+                        line: lines[line_i].clone(),
+                        rect,
+                        response,
+                    });
                 }
+                let cursor = self.handle_row_pointer(ctx, &rows, &slots);
+                for slot in &slots {
+                    self.paint_slot(ui, &rows, slot, playing);
+                }
+                self.paint_insertion(ui, &rows, &slots);
+                cursor
             });
-            self.finish_drag(ctx, &rects);
+            if let Some(icon) = output.inner {
+                ctx.set_cursor_icon(icon);
+            }
+            self.autoscroll(ctx, &output);
+            self.paint_row_ghost(ctx, &rows);
         });
     }
 
-    fn paint_line(
+    fn handle_row_pointer(
         &mut self,
-        ui: &mut egui::Ui,
+        ctx: &egui::Context,
         rows: &[RowView],
-        line: &Line,
-        playing_index: Option<usize>,
-        rects: &mut Vec<(usize, egui::Rect)>,
-    ) {
-        let width = ui.available_width();
-        let (rect, response) = match line {
-            Line::Header(_) => ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::hover()),
-            Line::Track(_) => {
-                ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::click_and_drag())
+        slots: &[Slot],
+    ) -> Option<egui::CursorIcon> {
+        for slot in slots {
+            if !slot.response.double_clicked() {
+                continue;
             }
+            let Line::Track(position) = &slot.line else {
+                continue;
+            };
+            let Some(row) = rows.get(*position) else {
+                continue;
+            };
+            self.selected.clear();
+            self.selected.insert(row.index);
+            self.row_drag = None;
+            if row.error.is_none() {
+                self.engine.command(Command::PlayIndex(row.index));
+                self.settle = 15;
+            }
+            return None;
+        }
+
+        let (pointer, pressed, down, delta) = ctx.input(|input| {
+            (
+                input.pointer.interact_pos(),
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+                input.pointer.delta().length(),
+            )
+        });
+
+        let mut started = false;
+        if pressed {
+            if let Some(pos) = pointer {
+                if let Some((position, index)) = hit_track(pos, rows, slots) {
+                    started = true;
+                    if self.selected.contains(&index) {
+                        self.row_drag = Some(RowDrag {
+                            gesture: RowGesture::Move { pressed: index },
+                            travel: 0.0,
+                            insert_before: None,
+                        });
+                    } else {
+                        self.selected.clear();
+                        self.selected.insert(index);
+                        self.row_drag = Some(RowDrag {
+                            gesture: RowGesture::Select {
+                                anchor: position,
+                                pressed: index,
+                            },
+                            travel: 0.0,
+                            insert_before: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        let Some(mut drag) = self.row_drag else {
+            return hover_cursor(&self.selected, rows, slots);
         };
-        match line {
+        if !started {
+            drag.travel += delta;
+        }
+        if drag.travel > DRAG_SLOP {
+            let spans = track_spans(rows, slots);
+            match drag.gesture {
+                RowGesture::Select { anchor, .. } => {
+                    if let Some(pos) = pointer {
+                        if let Some(position) = row_position_at(pos.y, &spans) {
+                            self.selected = indices_between(rows, anchor, position);
+                        }
+                    }
+                }
+                RowGesture::Move { .. } => {
+                    if let Some(pos) = pointer {
+                        drag.insert_before = drop_before(pos.y, &spans, playlist_len(rows));
+                    }
+                }
+            }
+        }
+
+        if down {
+            let icon = match drag.gesture {
+                RowGesture::Move { .. } if drag.travel > DRAG_SLOP => Some(egui::CursorIcon::Grabbing),
+                RowGesture::Move { .. } => hover_cursor(&self.selected, rows, slots),
+                RowGesture::Select { .. } => None,
+            };
+            self.row_drag = Some(drag);
+            ctx.request_repaint();
+            return icon;
+        }
+
+        self.row_drag = None;
+        if drag.travel <= DRAG_SLOP {
+            let pressed_index = match drag.gesture {
+                RowGesture::Select { pressed, .. } | RowGesture::Move { pressed } => pressed,
+            };
+            self.selected.clear();
+            self.selected.insert(pressed_index);
+            return hover_cursor(&self.selected, rows, slots);
+        }
+        if let RowGesture::Move { .. } = drag.gesture {
+            self.commit_move(rows, drag.insert_before);
+        }
+        None
+    }
+
+    fn commit_move(&mut self, rows: &[RowView], insert_before: Option<usize>) {
+        let Some(insert_before) = insert_before else {
+            return;
+        };
+        let mut indices: Vec<usize> = self.selected.iter().copied().collect();
+        indices.sort_unstable();
+        let Some(places) = Playlist::moved_places(playlist_len(rows), &indices, insert_before) else {
+            return;
+        };
+        self.engine.command(Command::MoveRows {
+            indices,
+            insert_before,
+        });
+        self.selected = places.into_iter().collect();
+        self.settle = 15;
+    }
+
+    fn paint_slot(&mut self, ui: &mut egui::Ui, rows: &[RowView], slot: &Slot, playing_index: Option<usize>) {
+        let rect = slot.rect;
+        match &slot.line {
             Line::Header(title) => {
                 ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(0x10, 0x18, 0x1e));
                 paint_text(
@@ -725,13 +905,30 @@ impl SeaSoundApp {
                     return;
                 };
                 let playing = playing_index == Some(row.index);
-                let selected = self.selected == Some(row.index);
+                let selected = self.selected.contains(&row.index);
+                let moving = self.row_drag.is_some_and(|drag| {
+                    drag.travel > DRAG_SLOP && matches!(drag.gesture, RowGesture::Move { .. })
+                });
                 if playing {
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(0x20, 0xa8, 0x9c, 48));
+                    ui.painter().rect_filled(
+                        rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(0x20, 0xa8, 0x9c, 56),
+                    );
                     let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 3.0, rect.bottom()));
                     ui.painter().rect_filled(bar, 0.0, ACCENT);
-                } else if selected || response.hovered() {
+                } else if selected {
+                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_white_alpha(32));
+                } else if slot.response.hovered() {
                     ui.painter().rect_filled(rect, 0.0, egui::Color32::from_white_alpha(14));
+                }
+                if moving && selected {
+                    ui.painter().rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(1.0, ACCENT),
+                        egui::StrokeKind::Inside,
+                    );
                 }
                 let columns = columns_for(rect);
                 let color = if row.error.is_some() {
@@ -755,51 +952,77 @@ impl SeaSoundApp {
                 };
                 paint_text(ui, columns.time, &time, color, false, egui::Align2::RIGHT_CENTER);
                 if let Some(warning) = self.warnings.get(&row.source_id) {
-                    response.clone().on_hover_text(warning.as_str());
+                    slot.response.clone().on_hover_text(warning.as_str());
                 }
-                if response.double_clicked() {
-                    self.selected = Some(row.index);
-                    if row.error.is_none() {
-                        self.engine.command(Command::PlayIndex(row.index));
-                        self.settle = 15;
-                    }
-                } else if response.clicked() {
-                    self.selected = Some(row.index);
-                }
-                if response.drag_started() {
-                    self.drag_from = Some(row.index);
-                    self.drag_travel = 0.0;
-                }
-                if response.dragged() {
-                    self.drag_travel += response.drag_delta().length();
-                }
-                rects.push((row.index, rect));
             }
         }
     }
 
-    fn finish_drag(&mut self, ctx: &egui::Context, rects: &[(usize, egui::Rect)]) {
-        let down = ctx.input(|input| input.pointer.any_down());
-        if self.drag_from.is_none() || down {
+    fn paint_insertion(&self, ui: &egui::Ui, rows: &[RowView], slots: &[Slot]) {
+        let Some(drag) = self.row_drag else {
+            return;
+        };
+        if drag.travel <= DRAG_SLOP {
             return;
         }
-        let from = self.drag_from.take().unwrap();
-        let travel = self.drag_travel;
-        self.drag_travel = 0.0;
-        if travel <= 8.0 {
+        let RowGesture::Move { .. } = drag.gesture else {
+            return;
+        };
+        let Some(insert_before) = drag.insert_before else {
+            return;
+        };
+        let spans = track_spans(rows, slots);
+        let Some(y) = insertion_y(insert_before, &spans, playlist_len(rows)) else {
+            return;
+        };
+        let Some(slot) = slots.first() else {
+            return;
+        };
+        paint_insertion_line(ui.painter(), slot.rect.left(), slot.rect.right(), y);
+    }
+
+    fn autoscroll<R>(&self, ctx: &egui::Context, output: &egui::containers::scroll_area::ScrollAreaOutput<R>) {
+        let Some(drag) = self.row_drag else {
+            return;
+        };
+        if drag.travel <= DRAG_SLOP {
             return;
         }
         let Some(pos) = ctx.input(|input| input.pointer.interact_pos()) else {
             return;
         };
-        let Some(&(to, _)) = rects.iter().rev().find(|(_, rect)| rect.contains(pos)) else {
+        let mut state = output.state;
+        let max_offset = (output.content_size.y - output.inner_rect.height()).max(0.0);
+        let mut next = state.offset.y;
+        if pos.y < output.inner_rect.top() + ROW_H {
+            let step = (output.inner_rect.top() + ROW_H - pos.y).clamp(6.0, 24.0);
+            next = (state.offset.y - step).max(0.0);
+        } else if pos.y > output.inner_rect.bottom() - ROW_H {
+            let step = (pos.y - (output.inner_rect.bottom() - ROW_H)).clamp(6.0, 24.0);
+            next = (state.offset.y + step).min(max_offset);
+        }
+        if next != state.offset.y {
+            state.offset.y = next;
+            state.store(ctx, output.id);
+            ctx.request_repaint();
+        }
+    }
+
+    fn paint_row_ghost(&self, ctx: &egui::Context, rows: &[RowView]) {
+        let Some(drag) = self.row_drag else {
             return;
         };
-        if to != from {
-            self.engine.command(Command::Reorder { from, to });
-            self.selected = Some(to);
-            self.settle = 15;
+        if drag.travel <= DRAG_SLOP || !matches!(drag.gesture, RowGesture::Move { .. }) {
+            return;
         }
+        let Some(pointer) = ctx.input(|input| input.pointer.interact_pos()) else {
+            return;
+        };
+        let label = ghost_text(rows, &self.selected);
+        if label.is_empty() {
+            return;
+        }
+        paint_ghost(ctx, pointer, &label);
     }
 
     fn ensure_cover(&mut self, ctx: &egui::Context, id: SourceId) {
@@ -971,7 +1194,11 @@ impl eframe::App for SeaSoundApp {
         self.transport(ctx);
         self.playlist_panel(ctx);
         self.arm_dialog(ctx);
-        if self.loading || self.snap.state == PlayState::Playing || self.settle > 0 || self.dialog.is_some()
+        if self.loading
+            || self.snap.state == PlayState::Playing
+            || self.settle > 0
+            || self.dialog.is_some()
+            || self.row_drag.is_some()
         {
             if self.settle > 0 {
                 self.settle -= 1;
@@ -1052,6 +1279,176 @@ fn saved_from_rows(rows: &[RowView]) -> SavedPlaylist {
             })
             .collect(),
     }
+}
+
+fn hit_track(pos: egui::Pos2, rows: &[RowView], slots: &[Slot]) -> Option<(usize, usize)> {
+    for slot in slots {
+        if !slot.rect.contains(pos) {
+            continue;
+        }
+        let Line::Track(position) = &slot.line else {
+            continue;
+        };
+        let Some(row) = rows.get(*position) else {
+            continue;
+        };
+        return Some((*position, row.index));
+    }
+    None
+}
+
+fn track_spans(rows: &[RowView], slots: &[Slot]) -> Vec<TrackSpan> {
+    let mut spans = Vec::new();
+    for slot in slots {
+        let Line::Track(position) = &slot.line else {
+            continue;
+        };
+        let Some(row) = rows.get(*position) else {
+            continue;
+        };
+        spans.push(TrackSpan {
+            index: row.index,
+            position: *position,
+            top: slot.rect.top(),
+            bottom: slot.rect.bottom(),
+        });
+    }
+    spans
+}
+
+fn hover_cursor(selected: &HashSet<usize>, rows: &[RowView], slots: &[Slot]) -> Option<egui::CursorIcon> {
+    let hover = slots.iter().any(|slot| {
+        if !slot.response.hovered() {
+            return false;
+        }
+        let Line::Track(position) = &slot.line else {
+            return false;
+        };
+        rows.get(*position).is_some_and(|row| selected.contains(&row.index))
+    });
+    if hover {
+        Some(egui::CursorIcon::Grab)
+    } else {
+        None
+    }
+}
+
+fn playlist_len(rows: &[RowView]) -> usize {
+    rows.iter().map(|row| row.index + 1).max().unwrap_or(0)
+}
+
+fn indices_between(rows: &[RowView], anchor: usize, current: usize) -> HashSet<usize> {
+    if rows.is_empty() {
+        return HashSet::new();
+    }
+    let last = rows.len() - 1;
+    let start = anchor.min(current).min(last);
+    let end = anchor.max(current).min(last);
+    rows[start..=end].iter().map(|row| row.index).collect()
+}
+
+/// The track whose rect contains `pointer_y`. A header gap belongs to the next track.
+fn row_position_at(pointer_y: f32, tracks: &[TrackSpan]) -> Option<usize> {
+    if tracks.is_empty() {
+        return None;
+    }
+    for track in tracks {
+        if pointer_y < track.bottom {
+            return Some(track.position);
+        }
+    }
+    Some(tracks[tracks.len() - 1].position)
+}
+
+fn after_track(index: usize, playlist_len: usize) -> usize {
+    let next = index.saturating_add(1);
+    if next < playlist_len {
+        next
+    } else {
+        playlist_len
+    }
+}
+
+/// Entry index to insert in front of. `playlist_len` means append.
+fn drop_before(pointer_y: f32, tracks: &[TrackSpan], playlist_len: usize) -> Option<usize> {
+    if tracks.is_empty() || playlist_len == 0 {
+        return None;
+    }
+    if pointer_y < tracks[0].center() {
+        return Some(tracks[0].index);
+    }
+    for pair in tracks.windows(2) {
+        if pointer_y < pair[1].center() {
+            return Some(pair[1].index);
+        }
+    }
+    Some(after_track(tracks[tracks.len() - 1].index, playlist_len))
+}
+
+fn insertion_y(insert_before: usize, tracks: &[TrackSpan], playlist_len: usize) -> Option<f32> {
+    for track in tracks {
+        if track.index == insert_before {
+            return Some(track.top);
+        }
+    }
+    let last = tracks.last()?;
+    if insert_before == playlist_len || insert_before == last.index + 1 {
+        Some(last.bottom)
+    } else {
+        None
+    }
+}
+
+fn ghost_label(count: usize, title: &str) -> String {
+    if count != 1 {
+        return format!("{count} tracks");
+    }
+    let len = title.chars().count();
+    if len > 48 {
+        let trimmed: String = title.chars().take(48).collect();
+        format!("{trimmed}…")
+    } else if title.is_empty() {
+        "1 track".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+fn ghost_text(rows: &[RowView], selected: &HashSet<usize>) -> String {
+    let mut titles = Vec::new();
+    for row in rows {
+        if selected.contains(&row.index) {
+            titles.push(row_title(row));
+        }
+    }
+    match titles.as_slice() {
+        [title] => ghost_label(1, title),
+        _ => ghost_label(titles.len(), ""),
+    }
+}
+
+fn paint_insertion_line(painter: &egui::Painter, left: f32, right: f32, y: f32) {
+    let line = egui::Rect::from_min_max(egui::pos2(left, y - 1.0), egui::pos2(right, y + 1.0));
+    painter.rect_filled(line, 0.0, ACCENT);
+    let nub = egui::Rect::from_min_max(egui::pos2(left, y - 5.0), egui::pos2(left + 8.0, y + 5.0));
+    painter.rect_filled(nub, 2.0, ACCENT);
+}
+
+fn paint_ghost(ctx: &egui::Context, pointer: egui::Pos2, label: &str) {
+    let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("playlist-drag-ghost"));
+    let painter = ctx.layer_painter(layer);
+    let font = egui::TextStyle::Body.resolve(ctx.style().as_ref());
+    let galley = painter.layout_no_wrap(label.to_owned(), font, egui::Color32::WHITE);
+    let pad = egui::vec2(10.0, 6.0);
+    let origin = pointer + egui::vec2(14.0, 16.0);
+    let rect = egui::Rect::from_min_size(origin, galley.size() + pad * 2.0);
+    painter.rect_filled(
+        rect,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(0x14, 0x1c, 0x22, 235),
+    );
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+    painter.galley(rect.min + pad, galley, egui::Color32::WHITE);
 }
 
 fn playlist_lines(rows: &[RowView]) -> Vec<Line> {
@@ -1282,5 +1679,56 @@ mod tests {
         assert_eq!(saved.rows[0].start_frame, 88200);
         assert_eq!(saved.rows[0].title, "On the Run");
         assert_eq!(saved.rows[0].path, PathBuf::from("/music/album.flac"));
+    }
+
+    fn span(index: usize, position: usize, top: f32) -> TrackSpan {
+        TrackSpan {
+            index,
+            position,
+            top,
+            bottom: top + ROW_H,
+        }
+    }
+
+    #[test]
+    fn dragging_across_rows_selects_the_visual_range() {
+        let rows = vec![
+            row(0, Some("Dark Side"), 0, "Speak to Me"),
+            row(1, None, 44100, "Breathe"),
+            row(2, None, 88200, "On the Run"),
+        ];
+        let selected = indices_between(&rows, 2, 0);
+        assert_eq!(selected.len(), 3);
+        assert!(selected.contains(&0) && selected.contains(&1) && selected.contains(&2));
+        assert_eq!(playlist_len(&rows), 3);
+    }
+
+    #[test]
+    fn drop_line_follows_track_centers_and_headers() {
+        // A header sits between track 0 (0..28) and track 1 (56..84).
+        let tracks = vec![span(0, 0, 0.0), span(1, 1, 56.0)];
+        assert_eq!(drop_before(10.0, &tracks, 3), Some(0));
+        assert_eq!(row_position_at(40.0, &tracks), Some(1));
+        assert_eq!(drop_before(40.0, &tracks, 3), Some(1));
+        assert_eq!(drop_before(80.0, &tracks, 3), Some(2));
+        assert_eq!(drop_before(90.0, &tracks, 2), Some(2));
+        assert_eq!(insertion_y(1, &tracks, 3), Some(56.0));
+        assert_eq!(insertion_y(2, &tracks, 3), Some(84.0));
+        assert_eq!(insertion_y(3, &tracks, 3), Some(84.0));
+        assert_eq!(insertion_y(5, &tracks, 6), None);
+    }
+
+    #[test]
+    fn ghost_label_names_one_track_and_counts_the_rest() {
+        assert_eq!(ghost_label(1, "Breathe"), "Breathe");
+        assert_eq!(ghost_label(3, "Breathe"), "3 tracks");
+        let long = "a".repeat(60);
+        assert_eq!(ghost_label(1, &long).chars().count(), 49);
+        let rows = vec![row(4, None, 0, "Speak to Me"), row(7, None, 1, "Breathe")];
+        let mut selected = HashSet::new();
+        selected.insert(7);
+        assert_eq!(ghost_text(&rows, &selected), "Breathe");
+        selected.insert(4);
+        assert_eq!(ghost_text(&rows, &selected), "2 tracks");
     }
 }
