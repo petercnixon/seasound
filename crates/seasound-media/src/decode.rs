@@ -17,6 +17,24 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::{Time, TimeBase};
 
 pub fn open_decoder(path: &Path, params: DecodeParams) -> Result<Box<dyn PcmSource>, Error> {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const BUILT_IN: &[&str] = &[
+        "mp3", "flac", "m4a", "m4b", "mp4", "wav", "aiff", "aif", "alac", "ogg", "oga",
+    ];
+    if !BUILT_IN.contains(&ext.as_str()) {
+        let request = seasound_plugin_api::DecodeRequest {
+            delay: params.delay,
+            padding: params.padding,
+            presentation_frames: params.presentation_frames,
+        };
+        if let Some(source) = crate::plugins::open_claimed(path, request)? {
+            return Ok(source);
+        }
+    }
     let source = SymphoniaSource::open(path, params)?;
     Ok(Box::new(source))
 }

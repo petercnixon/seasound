@@ -8,10 +8,15 @@ description = "File probing, cue sheets, chapters, and decoding for SeaSound"
 
 [dependencies]
 seasound-model.workspace = true
+seasound-plugin-api.workspace = true
 symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "alac", "aiff"] }
 lofty = "0.21"
 mp4ameta = "0.13"
 encoding_rs = "=0.8.35"
+libloading = "0.8"
 
 [dev-dependencies]
 serde_json = "1"
+wavicle = { path = "../../third_party/wavicle", features = ["encode"] }
+seasound-decoder-wavpack = { path = "../../plugins/seasound-decoder-wavpack" }
+seasound-plugin-badabi = { path = "../../plugins/seasound-plugin-badabi" }

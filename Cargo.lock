@@ -3100,15 +3100,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "seasound-decoder-wavpack"
+version = "0.1.0"
+dependencies = [
+ "seasound-plugin-api",
+ "wavicle",
+]
+
+[[package]]
 name = "seasound-media"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "libloading",
  "lofty",
  "mp4ameta",
+ "seasound-decoder-wavpack",
  "seasound-model",
+ "seasound-plugin-api",
+ "seasound-plugin-badabi",
  "serde_json",
  "symphonia",
+ "wavicle",
 ]
 
 [[package]]
@@ -3127,6 +3140,17 @@ dependencies = [
  "rtrb",
  "rubato",
  "seasound-model",
+]
+
+[[package]]
+name = "seasound-plugin-api"
+version = "0.1.0"
+
+[[package]]
+name = "seasound-plugin-badabi"
+version = "0.1.0"
+dependencies = [
+ "seasound-plugin-api",
 ]
 
 [[package]]
@@ -3978,6 +4002,10 @@ checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "wavicle"
+version = "0.1.0"
 
 [[package]]
 name = "wayland-backend"

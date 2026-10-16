@@ -8,9 +8,11 @@ mod cue;
 mod decode;
 mod flac;
 mod gapless;
+mod plugins;
 mod probe;
 
 pub use decode::open_decoder;
+pub use plugins::{install_plugins, plugin_extensions, plugin_statuses, set_plugin_enabled, PluginStatus};
 pub use probe::{load_paths, probe_file};
 
 pub use chapters::segments_from_chapters;

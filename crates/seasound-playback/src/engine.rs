@@ -947,6 +947,7 @@ mod tests {
             group_title: None,
             error: None,
             warning: None,
+            format_label: String::new(),
             cover: None,
         }
     }

@@ -1,0 +1,13 @@
+[package]
+name = "seasound-plugin-badabi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Test plugin that reports an unsupported ABI"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+seasound-plugin-api.workspace = true

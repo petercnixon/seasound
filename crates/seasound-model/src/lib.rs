@@ -156,11 +156,22 @@ pub struct Source {
     pub error: Option<String>,
     /// The file plays, but cue or chapter data was ignored.
     pub warning: Option<String>,
+    /// Name shown for a format the built-in enum does not list. Empty for those.
+    #[serde(default)]
+    pub format_label: String,
     #[serde(skip)]
     pub cover: Option<Cover>,
 }
 
 impl Source {
+    pub fn format_name(&self) -> &str {
+        if self.format_label.is_empty() {
+            self.format.label()
+        } else {
+            &self.format_label
+        }
+    }
+
     pub fn playable(&self) -> bool {
         self.error.is_none()
             && self.sample_rate > 0

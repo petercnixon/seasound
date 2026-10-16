@@ -20,6 +20,7 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 use crate::chapters::{segments_from_chapters, ChapterMark};
+use crate::plugins::{self, Claim};
 use crate::cue::{
     cue_album_title, decode_cue_bytes, merge_titles, parse_cue_text, segments_from_cue, CueTrack,
 };
@@ -65,10 +66,54 @@ pub fn probe_file(path: &Path) -> Source {
             .next()
             .unwrap_or_else(|| error_source(path, "the cue sheet did not list a readable audio file"));
     }
+    if !built_in_extension(path) {
+        match plugins::probe_claim(path) {
+            Claim::None => {}
+            Claim::Off { name } => return error_source(path, format!("{name} is turned off")),
+            Claim::Failed(message) => return error_source(path, message),
+            Claim::Ready(facts) => return source_from_plugin(path, facts),
+        }
+    }
     match probe_audio(path, CueMode::Discover) {
         Ok(source) => source,
         Err(err) => error_source(path, err.message()),
     }
+}
+
+fn built_in_extension(path: &Path) -> bool {
+    AUDIO_EXT.contains(&extension(path).as_str())
+}
+
+fn source_from_plugin(path: &Path, facts: plugins::ProbeFacts) -> Source {
+    let title = if facts.title.is_empty() {
+        file_stem(path).to_string()
+    } else {
+        facts.title
+    };
+    let source = Source {
+        id: SourceId(0),
+        path: path.to_path_buf(),
+        format: AudioFormat::Other,
+        sample_rate: facts.sample_rate,
+        channels: facts.channels,
+        delay: 0,
+        padding: 0,
+        presentation_frames: facts.presentation_frames,
+        artist: facts.artist,
+        album: facts.album,
+        title: title.clone(),
+        disc: facts.disc,
+        track_number: facts.track_number,
+        segments: Vec::new(),
+        group_title: None,
+        error: None,
+        warning: None,
+        format_label: facts.format_label,
+        cover: None,
+    };
+    let mut source = source;
+    source.segments = vec![whole_file_segment(&source)];
+    source
 }
 
 enum CueMode {
@@ -86,7 +131,7 @@ fn load_dir(dir: &Path) -> Vec<Source> {
         match extension(&path).as_str() {
             "cue" => cues.push(path),
             "m3u" | "m3u8" => {}
-            ext if AUDIO_EXT.contains(&ext) => audio.push(path),
+            ext if AUDIO_EXT.contains(&ext) || plugins::claims(ext) => audio.push(path),
             _ => {}
         }
     }
@@ -335,6 +380,7 @@ fn probe_audio(path: &Path, cue: CueMode) -> Result<Source, Error> {
         group_title: None,
         error: None,
         warning: None,
+        format_label: String::new(),
         cover: tags.cover,
     };
 
@@ -708,6 +754,7 @@ fn error_source(path: &Path, message: impl Into<String>) -> Source {
         group_title: None,
         error: Some(message),
         warning: None,
+        format_label: String::new(),
         cover: None,
     }
 }

@@ -704,6 +704,7 @@ mod tests {
             group_title: Some("album".into()),
             error: None,
             warning: None,
+            format_label: String::new(),
             cover: None,
         };
         let playlist = load_saved_playlist(&saved, vec![source]);
@@ -753,6 +754,7 @@ mod tests {
             group_title: None,
             error: None,
             warning: None,
+            format_label: String::new(),
             cover: None,
         }
     }

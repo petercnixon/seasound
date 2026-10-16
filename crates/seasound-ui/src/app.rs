@@ -53,6 +53,8 @@ pub struct SeaSoundApp {
     last_followed: Option<usize>,
     pending_scroll: Option<f32>,
     device_pref: Option<String>,
+    plugins: Vec<seasound_media::PluginStatus>,
+    disabled_plugins: Vec<String>,
 }
 
 /// Replace clears the playlist. Append keeps what is already there.
@@ -133,6 +135,8 @@ struct Settings {
     device: Option<String>,
     #[serde(default)]
     playlist: Option<PathBuf>,
+    #[serde(default)]
+    disabled_plugins: Vec<String>,
 }
 
 fn default_volume() -> f32 {
@@ -146,6 +150,7 @@ impl Default for Settings {
             muted: false,
             device: None,
             playlist: None,
+            disabled_plugins: Vec::new(),
         }
     }
 }
@@ -164,6 +169,13 @@ impl SeaSoundApp {
             .map(|path| load_settings(path))
             .unwrap_or_default();
         let volume = settings.volume.clamp(0.0, 1.0);
+        let plugin_dir = config_dir.as_ref().map(|dir| dir.join("plugins"));
+        if let Some(dir) = &plugin_dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let extra_dirs: Vec<PathBuf> = plugin_dir.into_iter().collect();
+        seasound_media::install_plugins(&extra_dirs, &settings.disabled_plugins);
+        let plugins = seasound_media::plugin_statuses();
         let engine = Engine::start(opener());
         engine.command(Command::SetVolume(volume));
         engine.command(Command::SetMuted(settings.muted));
@@ -196,6 +208,8 @@ impl SeaSoundApp {
             last_followed: None,
             pending_scroll: None,
             device_pref: settings.device,
+            plugins,
+            disabled_plugins: settings.disabled_plugins,
         };
         if let Some(path) = settings.playlist {
             if path.is_file() {
@@ -491,6 +505,50 @@ impl SeaSoundApp {
                         self.muted = !self.muted;
                         self.engine.command(Command::SetMuted(self.muted));
                         ui.close_menu();
+                    }
+                });
+                ui.menu_button("Plugins", |ui| {
+                    ui.set_min_width(280.0);
+                    ui.label("Plugins run with the same permissions as SeaSound.");
+                    ui.separator();
+                    if self.plugins.is_empty() {
+                        ui.label("No plugins loaded.");
+                        return;
+                    }
+                    let snapshot = self.plugins.clone();
+                    let mut toggle = None;
+                    for plugin in &snapshot {
+                        if let Some(error) = &plugin.error {
+                            let name = if plugin.name.is_empty() {
+                                plugin.file_name.as_str()
+                            } else {
+                                plugin.name.as_str()
+                            };
+                            ui.colored_label(ERROR, format!("{name} — {error}"));
+                            continue;
+                        }
+                        let mut on = plugin.enabled;
+                        let exts = plugin.extensions.join(", ");
+                        let label = if plugin.version.is_empty() {
+                            format!("{} ({exts})", plugin.name)
+                        } else {
+                            format!("{} {} ({exts})", plugin.name, plugin.version)
+                        };
+                        if ui.checkbox(&mut on, label).changed() {
+                            toggle = Some((plugin.id.clone(), on));
+                        }
+                    }
+                    if let Some((id, on)) = toggle {
+                        if let Some(plugin) = self.plugins.iter_mut().find(|plugin| plugin.id == id) {
+                            plugin.enabled = on;
+                        }
+                        seasound_media::set_plugin_enabled(&id, on);
+                        if on {
+                            self.disabled_plugins.retain(|item| item != &id);
+                        } else if !self.disabled_plugins.iter().any(|item| item == &id) {
+                            self.disabled_plugins.push(id);
+                        }
+                        self.write_settings();
                     }
                 });
             });
@@ -951,7 +1009,9 @@ impl SeaSoundApp {
                     format_time(row.frames, row.sample_rate.max(1))
                 };
                 paint_text(ui, columns.time, &time, color, false, egui::Align2::RIGHT_CENTER);
-                if let Some(warning) = self.warnings.get(&row.source_id) {
+                if let Some(error) = &row.error {
+                    slot.response.clone().on_hover_text(error.as_str());
+                } else if let Some(warning) = self.warnings.get(&row.source_id) {
                     slot.response.clone().on_hover_text(warning.as_str());
                 }
             }
@@ -1071,8 +1131,9 @@ impl SeaSoundApp {
     fn run_dialog(&mut self, dialog: Dialog) {
         match dialog {
             Dialog::Files(import) => {
+                let filters = audio_filter_exts();
                 if let Some(paths) = rfd::FileDialog::new()
-                    .add_filter("Audio", AUDIO_EXT)
+                    .add_filter("Audio", &filters)
                     .add_filter("All files", &["*"])
                     .pick_files()
                 {
@@ -1150,6 +1211,7 @@ impl SeaSoundApp {
             muted: self.muted,
             device,
             playlist: self.playlist_path.clone(),
+            disabled_plugins: self.disabled_plugins.clone(),
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1233,6 +1295,16 @@ impl LoadWork {
             },
         }
     }
+}
+
+fn audio_filter_exts() -> Vec<String> {
+    let mut exts: Vec<String> = AUDIO_EXT.iter().map(|ext| (*ext).to_string()).collect();
+    for ext in seasound_media::plugin_extensions() {
+        if !exts.iter().any(|have| have == &ext) {
+            exts.push(ext);
+        }
+    }
+    exts
 }
 
 fn opener() -> Opener {
