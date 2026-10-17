@@ -198,6 +198,15 @@ impl From<&Source> for DecodeParams {
     }
 }
 
+/// What [`PcmSource::pull_available`] got from the decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRead {
+    /// Frames written into the buffer. Zero means the presentation has ended.
+    Frames(usize),
+    /// Nothing is queued yet. The presentation has not ended.
+    Pending,
+}
+
 /// Decoded audio on the presentation timeline.
 ///
 /// `pull` returns frames that the listener should hear. Encoder delay and padding
@@ -211,6 +220,12 @@ pub trait PcmSource: Send {
     /// Write up to `interleaved.len() / channels` frames.
     /// Returns the number of frames written. Zero means the presentation has ended.
     fn pull(&mut self, interleaved: &mut [f32]) -> Result<usize, Error>;
+
+    /// Like [`pull`](Self::pull), but a buffered decoder can report [`SourceRead::Pending`]
+    /// instead of blocking or pretending the presentation has ended.
+    fn pull_available(&mut self, interleaved: &mut [f32]) -> Result<SourceRead, Error> {
+        Ok(SourceRead::Frames(self.pull(interleaved)?))
+    }
 
     fn seek_presentation(&mut self, frame: u64) -> Result<(), Error>;
 }

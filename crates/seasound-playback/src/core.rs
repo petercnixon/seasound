@@ -3,7 +3,7 @@
 //! A contiguous range on the same decoder is read straight through. Anything else
 //! seeks. Sample rate conversion keeps its filter when the rate does not change.
 
-use seasound_model::{ChannelMap, Error, PcmSource, SourceId};
+use seasound_model::{ChannelMap, Error, PcmSource, SourceId, SourceRead};
 
 use crate::resample::RateConvert;
 
@@ -20,6 +20,8 @@ pub struct PullResult {
     pub source_start: u64,
     pub source_frames: u64,
     pub sample_rate: u32,
+    /// The decoder has no buffered audio yet. `frames == 0` here is not the end of the segment.
+    pub pending: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -146,6 +148,7 @@ impl PlayerCore {
                 source_start: job.start,
                 source_frames: 0,
                 sample_rate: self.output_rate,
+                pending: false,
             });
         }
         self.prepare(job)?;
@@ -163,7 +166,20 @@ impl PlayerCore {
             let room = capacity - written;
             let rate = self.active.as_ref().map(|active| active.rate).unwrap_or(1).max(1);
             let want = source_frames_for(room, rate, self.output_rate, job.end - position);
-            let got = self.read_source(want)?;
+            let Some(got) = self.read_source(want)? else {
+                let position_now = self
+                    .active
+                    .as_ref()
+                    .map(|active| active.position)
+                    .unwrap_or(source_start);
+                return Ok(PullResult {
+                    frames: written,
+                    source_start,
+                    source_frames: position_now.saturating_sub(source_start),
+                    sample_rate: source_rate,
+                    pending: true,
+                });
+            };
             if got == 0 {
                 if let Some(active) = self.active.as_mut() {
                     active.position = job.end;
@@ -190,6 +206,7 @@ impl PlayerCore {
             source_start,
             source_frames: position_now.saturating_sub(source_start),
             sample_rate: source_rate,
+            pending: false,
         })
     }
 
@@ -284,12 +301,13 @@ impl PlayerCore {
         Ok(())
     }
 
-    fn read_source(&mut self, frames: usize) -> Result<usize, Error> {
+    /// `None` means the decoder is not ready yet. That is not the end of the file.
+    fn read_source(&mut self, frames: usize) -> Result<Option<usize>, Error> {
         let Some(active) = self.active.as_ref() else {
-            return Ok(0);
+            return Ok(Some(0));
         };
         if frames == 0 {
-            return Ok(0);
+            return Ok(Some(0));
         }
         let channels = active.channels as usize;
         let map = active.map;
@@ -298,20 +316,23 @@ impl PlayerCore {
             self.raw.resize(samples, 0.0);
         }
         let mut raw = std::mem::take(&mut self.raw);
-        let got = {
+        let read = {
             let active = self.active.as_mut().expect("active source");
-            let n = active.source.pull(&mut raw[..samples])?;
-            if n > 0 {
-                active.position += n as u64;
-            }
-            n
+            active.source.pull_available(&mut raw[..samples])?
         };
         self.raw = raw;
+        let got = match read {
+            SourceRead::Pending => return Ok(None),
+            SourceRead::Frames(got) => got,
+        };
         if got == 0 {
-            return Ok(0);
+            return Ok(Some(0));
+        }
+        if let Some(active) = self.active.as_mut() {
+            active.position += got as u64;
         }
         downmix(&self.raw[..got * channels], map, &mut self.stereo);
-        Ok(got)
+        Ok(Some(got))
     }
 }
 
@@ -359,7 +380,7 @@ fn downmix(interleaved: &[f32], map: ChannelMap, stereo: &mut Vec<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seasound_model::PcmSource;
+    use seasound_model::{PcmSource, SourceRead};
 
     struct Ramp {
         rate: u32,
@@ -570,5 +591,68 @@ mod tests {
         );
         let mean = samples.iter().sum::<f32>() / samples.len() as f32;
         assert!(mean > 0.7, "mean level {mean}");
+    }
+
+    struct Stall {
+        inner: Ramp,
+        stalls: usize,
+    }
+
+    impl PcmSource for Stall {
+        fn sample_rate(&self) -> u32 {
+            self.inner.rate
+        }
+        fn channels(&self) -> u16 {
+            self.inner.channels
+        }
+        fn channel_map(&self) -> ChannelMap {
+            if self.inner.channels == 1 {
+                ChannelMap::Mono
+            } else {
+                ChannelMap::Stereo
+            }
+        }
+        fn presentation_frames(&self) -> u64 {
+            self.inner.len
+        }
+        fn pull(&mut self, interleaved: &mut [f32]) -> Result<usize, Error> {
+            self.inner.pull(interleaved)
+        }
+        fn pull_available(&mut self, interleaved: &mut [f32]) -> Result<SourceRead, Error> {
+            if self.stalls > 0 {
+                self.stalls -= 1;
+                return Ok(SourceRead::Pending);
+            }
+            Ok(SourceRead::Frames(self.pull(interleaved)?))
+        }
+        fn seek_presentation(&mut self, frame: u64) -> Result<(), Error> {
+            self.inner.seek_presentation(frame)
+        }
+    }
+
+    #[test]
+    fn a_pending_read_does_not_finish_the_segment() {
+        let mut core = PlayerCore::new(44100);
+        core.store_prefetch(
+            SourceId(1),
+            Box::new(Stall {
+                inner: Ramp::frames(10),
+                stalls: 1,
+            }),
+        );
+        let job = SegmentJob {
+            source_id: SourceId(1),
+            start: 0,
+            end: 10,
+        };
+        let mut buf = vec![0f32; 64];
+        let first = core.pull(job, &mut buf, true).unwrap();
+        assert!(first.pending);
+        assert_eq!(first.frames, 0);
+        assert!(!core.job_done(job));
+        let second = core.pull(job, &mut buf, true).unwrap();
+        assert!(!second.pending);
+        assert_eq!(second.frames, 10);
+        assert!(core.job_done(job));
     }
 }

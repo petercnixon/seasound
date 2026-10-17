@@ -1,5 +1,6 @@
 //! Playback. This crate never parses a container. Callers hand it a [`PcmSource`].
 
+mod ahead;
 mod core;
 mod device;
 mod engine;

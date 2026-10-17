@@ -221,9 +221,10 @@ fn playback_thread(
                     buffer.resize(samples, 0.0);
                 }
                 match deck.fill(&mut buffer[..samples]) {
-                    Ok(0) => deck.state = PlayState::Stopped,
-                    Ok(wrote) => {
-                        let accepted = output.push(&buffer[..wrote * 2]);
+                    Ok(Fill { frames: 0, waiting: true }) => thread::sleep(Duration::from_millis(2)),
+                    Ok(Fill { frames: 0, waiting: false }) => deck.state = PlayState::Stopped,
+                    Ok(Fill { frames, .. }) => {
+                        let accepted = output.push(&buffer[..frames * 2]);
                         if accepted > 0 {
                             deck.note_written(accepted as u64);
                         }
@@ -441,7 +442,18 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
             }
         }
     }
+    deck.refresh_prefetch();
     false
+}
+
+struct Fill {
+    frames: usize,
+    waiting: bool,
+}
+
+enum Opened {
+    Ready(Box<dyn PcmSource>),
+    Later,
 }
 
 struct Deck {
@@ -562,7 +574,7 @@ impl Deck {
         segment.start_frame + offset.min(segment.frames().saturating_sub(1))
     }
 
-    fn fill(&mut self, out: &mut [f32]) -> Result<usize, Error> {
+    fn fill(&mut self, out: &mut [f32]) -> Result<Fill, Error> {
         let mut written = 0usize;
         let capacity = out.len() / 2;
         let mut spins = 0;
@@ -578,9 +590,31 @@ impl Deck {
                 continue;
             }
             let job = self.job(index)?;
-            self.ensure(job.source_id)?;
+            if !self.ensure(job.source_id)? {
+                return Ok(Fill {
+                    frames: written,
+                    waiting: true,
+                });
+            }
             let flush = !self.continues_after(index);
             let pulled = self.core.pull(job, &mut out[written * 2..], flush)?;
+            if pulled.frames > 0 {
+                self.spans.push(Span {
+                    source_id: job.source_id,
+                    segment: self.playlist.entries.get(index).map(|entry| entry.segment).unwrap_or(0),
+                    out_start: self.queued + written as u64,
+                    out_frames: pulled.frames as u64,
+                    source_start: pulled.source_start,
+                    source_frames: pulled.source_frames.max(1),
+                });
+                written += pulled.frames;
+            }
+            if pulled.pending {
+                return Ok(Fill {
+                    frames: written,
+                    waiting: true,
+                });
+            }
             if pulled.frames == 0 {
                 if self.core.job_done(job) {
                     if self.advance_from(index).is_none() {
@@ -590,20 +624,14 @@ impl Deck {
                 }
                 break;
             }
-            self.spans.push(Span {
-                source_id: job.source_id,
-                segment: self.playlist.entries.get(index).map(|entry| entry.segment).unwrap_or(0),
-                out_start: self.queued + written as u64,
-                out_frames: pulled.frames as u64,
-                source_start: pulled.source_start,
-                source_frames: pulled.source_frames.max(1),
-            });
-            written += pulled.frames;
             if self.core.job_done(job) && self.advance_from(index).is_none() {
                 break;
             }
         }
-        Ok(written)
+        Ok(Fill {
+            frames: written,
+            waiting: false,
+        })
     }
 
     fn job(&mut self, index: usize) -> Result<SegmentJob, Error> {
@@ -643,20 +671,32 @@ impl Deck {
         source.segments.get(entry.segment)
     }
 
-    fn ensure(&mut self, id: SourceId) -> Result<(), Error> {
+    /// `false` means the decoder is still opening. The caller should wait and try again.
+    fn ensure(&mut self, id: SourceId) -> Result<bool, Error> {
         if self.core.has_source(id) {
-            return Ok(());
+            return Ok(true);
         }
-        let source = self.open_for(id)?;
-        self.core.store_prefetch(id, source);
-        Ok(())
+        match self.open_for(id)? {
+            Opened::Later => Ok(false),
+            Opened::Ready(source) => {
+                self.core.store_prefetch(id, source);
+                self.refresh_prefetch();
+                Ok(true)
+            }
+        }
     }
 
-    fn open_for(&mut self, id: SourceId) -> Result<Box<dyn PcmSource>, Error> {
-        if let Some(inflight) = self.inflight.take() {
-            if inflight.id == id {
-                if let Ok(opened) = inflight.rx.recv() {
-                    return opened;
+    fn open_for(&mut self, id: SourceId) -> Result<Opened, Error> {
+        if self.inflight.as_ref().is_some_and(|inflight| inflight.id == id) {
+            let inflight = self.inflight.take().expect("checked");
+            match inflight.rx.try_recv() {
+                Ok(opened) => return opened.map(Opened::Ready),
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.inflight = Some(inflight);
+                    return Ok(Opened::Later);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(Error::new("the next file failed to open"));
                 }
             }
         }
@@ -665,36 +705,81 @@ impl Deck {
             .source(id)
             .cloned()
             .ok_or_else(|| Error::new("that file is no longer in the playlist"))?;
-        (self.opener)(&source)
+        let opened = (self.opener)(&source)?;
+        Ok(Opened::Ready(crate::ahead::Ahead::boxed(opened)))
     }
 
-    fn consider_prefetch(&mut self) {
-        let Some(index) = self.cursor.index() else {
-            return;
-        };
+    fn upcoming_source(&self) -> Option<SourceId> {
+        let index = self.cursor.index()?;
         let mut peek = self.cursor.clone();
         let seasound_model::Step::To(next) = peek.advance() else {
-            return;
+            return None;
         };
         if next == index || !self.playable(next) {
+            return None;
+        }
+        self.playlist.entries.get(next).map(|entry| entry.source_id)
+    }
+
+    /// The prefetched decoder is the file we just moved to, and it is not in the core yet.
+    fn inflight_is_current(&self) -> bool {
+        let Some(inflight) = self.inflight.as_ref() else {
+            return false;
+        };
+        let Some(index) = self.cursor.index() else {
+            return false;
+        };
+        let Some(entry) = self.playlist.entries.get(index) else {
+            return false;
+        };
+        inflight.id == entry.source_id && !self.core.has_source(entry.source_id)
+    }
+
+    /// Open the file that will play next, and drop a prefetch that is no longer that file.
+    ///
+    /// The open runs on a worker and decodes several seconds before the splice.
+    /// A prefetch for the file we are about to adopt is left alone.
+    fn refresh_prefetch(&mut self) {
+        if self.state != PlayState::Playing {
             return;
         }
-        let Some(entry) = self.playlist.entries.get(next) else {
+        let next = self.upcoming_source();
+        if let Some(id) = next {
+            if self.core.has_source(id) {
+                let stale = self
+                    .inflight
+                    .as_ref()
+                    .is_some_and(|inflight| inflight.id != id);
+                if stale && !self.inflight_is_current() {
+                    self.inflight = None;
+                }
+                return;
+            }
+            if self.inflight.as_ref().is_some_and(|inflight| inflight.id == id) {
+                return;
+            }
+        }
+        if self.inflight_is_current() {
+            return;
+        }
+        self.inflight = None;
+        let Some(id) = next else {
             return;
         };
-        let id = entry.source_id;
-        if self.core.has_source(id) || self.inflight.as_ref().is_some_and(|inflight| inflight.id == id) {
-            return;
-        }
         let Some(source) = self.playlist.source(id).cloned() else {
             return;
         };
         let (tx, rx) = mpsc::channel();
         let opener = Arc::clone(&self.opener);
         thread::spawn(move || {
-            let _ = tx.send(opener(&source));
+            let opened = opener(&source).map(crate::ahead::Ahead::boxed);
+            let _ = tx.send(opened);
         });
         self.inflight = Some(Inflight { id, rx });
+    }
+
+    fn consider_prefetch(&mut self) {
+        self.refresh_prefetch();
     }
 
     fn continues_after(&self, index: usize) -> bool {
@@ -1086,12 +1171,23 @@ mod tests {
         }
         let opened = opens.load(std::sync::atomic::Ordering::SeqCst);
         engine.command(Command::Append(Playlist::new(vec![source("second.mp3", 1000)])));
-        thread::sleep(Duration::from_millis(40));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let now = opens.load(std::sync::atomic::Ordering::SeqCst);
+            if snapshot.rows.len() == 2 && snapshot.state == PlayState::Playing && now >= opened + 1 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("append did not prefetch the new row: opens {now} state {:?}", snapshot.state);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.rows.len(), 2);
         assert_eq!(snapshot.rows[1].title, "second.mp3");
         assert_eq!(snapshot.state, PlayState::Playing);
-        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), opened);
+        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), opened + 1);
         engine.command(Command::Clear);
         thread::sleep(Duration::from_millis(40));
         let snapshot = engine.snapshot();
@@ -1280,6 +1376,301 @@ mod tests {
                 );
             }
             thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_stalled_decoder_does_not_end_playback() {
+        let hold = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let gate = std::sync::Arc::clone(&hold);
+        let opener: Opener = std::sync::Arc::new(move |source| {
+            Ok(Box::new(Hold {
+                inner: Ramp {
+                    len: source.presentation_frames,
+                    pos: 0,
+                },
+                hold: std::sync::Arc::clone(&gate),
+            }))
+        });
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let engine = Engine::start_with(opener, Box::new(memory));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("held.wav", 1000)]),
+            autoplay: true,
+        });
+        thread::sleep(Duration::from_millis(150));
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, PlayState::Playing, "a stall looked like the end of the file");
+        assert!(snapshot.error.is_none());
+        hold.store(false, std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let samples = recorded.lock().unwrap().len() / 2;
+            if engine.snapshot().state == PlayState::Stopped && samples >= 1000 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("playback did not finish after the stall, samples {samples}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_next_file_is_decoded_before_the_splice_so_a_slow_open_does_not_empty_the_ring() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(ClockState {
+            samples: Vec::new(),
+            queued: 0,
+            played: 0,
+        }));
+        let empty_us = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let total = 88_200 + 17_640;
+        let ticker_stop = std::sync::Arc::clone(&stop);
+        let ticker_shared = std::sync::Arc::clone(&shared);
+        let ticker_empty = std::sync::Arc::clone(&empty_us);
+        let ticker = thread::spawn(move || {
+            let mut empty_since: Option<std::time::Instant> = None;
+            loop {
+                if ticker_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                let mut state = ticker_shared.lock().unwrap();
+                let produced = state.samples.len() / 2;
+                let starved = produced > 0 && produced < total && state.queued == 0;
+                if starved {
+                    if empty_since.is_none() {
+                        empty_since = Some(now);
+                    }
+                } else if let Some(start) = empty_since.take() {
+                    let gap = now.saturating_duration_since(start).as_micros() as u64;
+                    ticker_empty.fetch_add(gap, std::sync::atomic::Ordering::SeqCst);
+                }
+                let step = 882.min(state.queued);
+                state.queued -= step;
+                state.played += step as u64;
+                drop(state);
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let opener: Opener = std::sync::Arc::new(|source| {
+            let slow = source.title == "b";
+            if slow {
+                thread::sleep(Duration::from_millis(200));
+            }
+            Ok(Box::new(Tone {
+                len: source.presentation_frames,
+                pos: 0,
+                value: if slow { 0.75 } else { 0.25 },
+                nap: if slow {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_millis(0)
+                },
+                napped: false,
+            }))
+        });
+        let engine = Engine::start_with(
+            opener,
+            Box::new(ClockOutput {
+                shared: std::sync::Arc::clone(&shared),
+                capacity: 44_100 / 5,
+            }),
+        );
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("a", 88_200), source("b", 17_640)]),
+            autoplay: true,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let state = engine.snapshot().state;
+            let produced = shared.lock().unwrap().samples.len() / 2;
+            if state == PlayState::Stopped && produced >= total {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("slow splice did not finish: state {:?} produced {produced}", state);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        ticker.join().unwrap();
+        let empty = empty_us.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            empty < 120_000,
+            "the ring was empty for {} ms across the splice",
+            empty / 1000
+        );
+        let guard = shared.lock().unwrap();
+        let left: Vec<f32> = guard.samples.iter().step_by(2).copied().collect();
+        assert_eq!(left.len(), total);
+        assert!(left[..88_200].iter().all(|sample| *sample == 0.25));
+        assert!(left[88_200..].iter().all(|sample| *sample == 0.75));
+    }
+
+    #[test]
+    fn reordering_the_upcoming_row_prefetches_the_new_next_file() {
+        let opens = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = std::sync::Arc::clone(&opens);
+        let opener: Opener = std::sync::Arc::new(move |source| {
+            recorded.lock().unwrap().push(source.title.clone());
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let engine = Engine::start_with(opener, Box::new(MemoryOutput::new(44100)));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![
+                source("a", u64::MAX / 4),
+                source("b", u64::MAX / 4),
+                source("c", u64::MAX / 4),
+            ]),
+            autoplay: true,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let names = opens.lock().unwrap().clone();
+            if names.iter().any(|name| name == "a") && names.iter().any(|name| name == "b") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("prefetch of b did not start: {names:?}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        engine.command(Command::Reorder { from: 2, to: 1 });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let names = opens.lock().unwrap().clone();
+            if names.iter().any(|name| name == "c") {
+                assert_eq!(names.iter().filter(|name| *name == "a").count(), 1);
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("reorder did not prefetch c: {names:?}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    struct Hold {
+        inner: Ramp,
+        hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl PcmSource for Hold {
+        fn sample_rate(&self) -> u32 {
+            44100
+        }
+        fn channels(&self) -> u16 {
+            2
+        }
+        fn channel_map(&self) -> ChannelMap {
+            ChannelMap::Stereo
+        }
+        fn presentation_frames(&self) -> u64 {
+            self.inner.len
+        }
+        fn pull(&mut self, interleaved: &mut [f32]) -> Result<usize, Error> {
+            while self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.inner.pull(interleaved)
+        }
+        fn seek_presentation(&mut self, frame: u64) -> Result<(), Error> {
+            self.inner.seek_presentation(frame)
+        }
+    }
+
+    struct Tone {
+        len: u64,
+        pos: u64,
+        value: f32,
+        nap: Duration,
+        napped: bool,
+    }
+
+    impl PcmSource for Tone {
+        fn sample_rate(&self) -> u32 {
+            44100
+        }
+        fn channels(&self) -> u16 {
+            2
+        }
+        fn channel_map(&self) -> ChannelMap {
+            ChannelMap::Stereo
+        }
+        fn presentation_frames(&self) -> u64 {
+            self.len
+        }
+        fn pull(&mut self, interleaved: &mut [f32]) -> Result<usize, Error> {
+            if !self.napped && !self.nap.is_zero() {
+                self.napped = true;
+                thread::sleep(self.nap);
+            }
+            let frames = interleaved.len() / 2;
+            let n = frames.min(self.len.saturating_sub(self.pos) as usize);
+            for index in 0..n {
+                interleaved[index * 2] = self.value;
+                interleaved[index * 2 + 1] = self.value;
+            }
+            self.pos += n as u64;
+            Ok(n)
+        }
+        fn seek_presentation(&mut self, frame: u64) -> Result<(), Error> {
+            self.pos = frame.min(self.len);
+            Ok(())
+        }
+    }
+
+    struct ClockState {
+        samples: Vec<f32>,
+        queued: usize,
+        played: u64,
+    }
+
+    struct ClockOutput {
+        shared: std::sync::Arc<std::sync::Mutex<ClockState>>,
+        capacity: usize,
+    }
+
+    impl AudioOut for ClockOutput {
+        fn sample_rate(&self) -> u32 {
+            44100
+        }
+        fn free_frames(&self) -> usize {
+            let state = self.shared.lock().unwrap();
+            self.capacity.saturating_sub(state.queued)
+        }
+        fn push(&mut self, stereo: &[f32]) -> usize {
+            let mut state = self.shared.lock().unwrap();
+            let frames = (stereo.len() / 2).min(self.capacity.saturating_sub(state.queued));
+            state.samples.extend_from_slice(&stereo[..frames * 2]);
+            state.queued += frames;
+            frames
+        }
+        fn clear(&mut self) {
+            self.shared.lock().unwrap().queued = 0;
+        }
+        fn set_paused(&mut self, _paused: bool) {}
+        fn set_gain(&mut self, _gain: f32) {}
+        fn played(&self) -> u64 {
+            self.shared.lock().unwrap().played
+        }
+        fn underruns(&self) -> u64 {
+            0
+        }
+        fn device_name(&self) -> String {
+            "clock".into()
+        }
+        fn devices(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn set_device(&mut self, _name: Option<&str>) -> Result<(), Error> {
+            Ok(())
         }
     }
 }
