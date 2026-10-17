@@ -1013,6 +1013,8 @@ mod tests {
             format: AudioFormat::Wav,
             sample_rate: 44100,
             channels: 2,
+            bitrate_bps: 0,
+            bits_per_sample: 16,
             delay: 0,
             padding: 0,
             presentation_frames: frames,

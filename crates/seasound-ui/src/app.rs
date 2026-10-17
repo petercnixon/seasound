@@ -571,22 +571,22 @@ impl SeaSoundApp {
         }
         egui::TopBottomPanel::bottom("transport").show(ctx, |ui| {
             ui.add_space(6.0);
-            // The seek rail must use the panel width. Nested `horizontal` /
-            // `vertical` calls shrink-wrap, and `Slider` paints `spacing.slider_width`
+            // The seek rail must use its column. Nested `horizontal` / `vertical`
+            // calls shrink-wrap, and `Slider` paints `spacing.slider_width`
             // (default 100) rather than the rectangle passed to `add_sized`.
-            let panel_width = ui.available_width();
-            let cover = 84.0;
+            // The column is the left half. File facts use the right half.
             let gap = 8.0;
-            let column_width =
-                (panel_width - cover - gap - ui.spacing().item_spacing.x).max(160.0);
             ui.horizontal_top(|ui| {
                 self.cover_box(ui, source_id);
                 ui.add_space(gap);
+                let gutter = 16.0;
+                let rest = ui.available_width();
+                let main_width = ((rest - gutter) * 0.5).max(140.0);
                 ui.allocate_ui_with_layout(
-                    egui::vec2(column_width, 132.0),
+                    egui::vec2(main_width, 132.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                    ui.set_min_width(column_width);
+                    ui.set_min_width(main_width);
                     let title = row
                         .as_ref()
                         .map(|row| row_title(row))
@@ -667,6 +667,22 @@ impl SeaSoundApp {
                         }
                     });
                 });
+                let (rule, _) = ui.allocate_exact_size(egui::vec2(gutter, 112.0), egui::Sense::hover());
+                let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+                ui.painter().vline(
+                    rule.center().x,
+                    (rule.top() + 6.0)..=(rule.bottom() - 2.0),
+                    stroke,
+                );
+                let details_width = ui.available_width();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(details_width, 132.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_width(details_width);
+                        file_details(ui, row.as_ref());
+                    },
+                );
             });
             ui.add_space(4.0);
             self.status_line(ui, &snap, source_id);
@@ -1557,6 +1573,113 @@ fn row_title(row: &RowView) -> String {
         .to_string()
 }
 
+fn file_details(ui: &mut egui::Ui, row: Option<&RowView>) {
+    let (codec, bitrate, rate, channels, bits) = match row {
+        Some(row) => (
+            codec_label(&row.format_name, &row.path),
+            format_bitrate(row.bitrate_bps),
+            format_sample_rate(row.sample_rate),
+            format_channels(row.channels),
+            format_bit_depth(row.bits_per_sample),
+        ),
+        None => (
+            em_dash(),
+            em_dash(),
+            em_dash(),
+            em_dash(),
+            em_dash(),
+        ),
+    };
+    ui.add_space(2.0);
+    egui::Grid::new("now-playing-details")
+        .spacing(egui::vec2(18.0, 4.0))
+        .show(ui, |ui| {
+            detail_line(ui, "Format", &codec);
+            detail_line(ui, "Bitrate", &bitrate);
+            detail_line(ui, "Sample rate", &rate);
+            detail_line(ui, "Channels", &channels);
+            detail_line(ui, "Bit depth", &bits);
+        });
+}
+
+fn detail_line(ui: &mut egui::Ui, label: &str, value: &str) {
+    let weak = ui.visuals().weak_text_color();
+    ui.label(egui::RichText::new(label).color(weak).size(13.0));
+    let value_color = if value == "—" { weak } else { ui.visuals().text_color() };
+    ui.label(egui::RichText::new(value).color(value_color).size(13.0));
+    ui.end_row();
+}
+
+fn em_dash() -> String {
+    "—".to_string()
+}
+
+fn codec_label(format_name: &str, path: &Path) -> String {
+    let codec = format_name.trim();
+    if codec.is_empty() || codec == "Audio" {
+        return extension_token(path).unwrap_or_else(em_dash);
+    }
+    match extension_token(path) {
+        Some(ext) if !same_kind(codec, &ext) => format!("{codec} · {ext}"),
+        _ => codec.to_string(),
+    }
+}
+
+fn extension_token(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.trim();
+    if ext.is_empty() {
+        None
+    } else {
+        Some(ext.to_ascii_uppercase())
+    }
+}
+
+fn same_kind(codec: &str, ext: &str) -> bool {
+    let codec = codec.to_ascii_lowercase();
+    let ext = ext.to_ascii_lowercase();
+    codec == ext || (codec == "aiff" && ext == "aif")
+}
+
+fn format_bitrate(bps: u32) -> String {
+    if bps == 0 {
+        return em_dash();
+    }
+    let kbps = ((bps as u64) + 500) / 1000;
+    format!("{kbps} kbps")
+}
+
+fn format_sample_rate(rate: u32) -> String {
+    if rate == 0 {
+        return em_dash();
+    }
+    if rate % 1000 == 0 {
+        format!("{} kHz", rate / 1000)
+    } else if rate % 100 == 0 {
+        format!("{:.1} kHz", rate as f64 / 1000.0)
+    } else {
+        format!("{rate} Hz")
+    }
+}
+
+fn format_channels(channels: u16) -> String {
+    match channels {
+        0 => em_dash(),
+        1 => "Mono".to_string(),
+        2 => "Stereo".to_string(),
+        6 => "5.1".to_string(),
+        8 => "7.1".to_string(),
+        n => format!("{n} channels"),
+    }
+}
+
+fn format_bit_depth(bits: u16) -> String {
+    if bits == 0 {
+        em_dash()
+    } else {
+        format!("{bits}-bit")
+    }
+}
+
 fn subtitle(row: Option<&RowView>, snap: &Snapshot) -> String {
     let artist = row.map(|row| row.artist.as_str()).unwrap_or(snap.artist.as_str());
     let album = row.map(|row| row.album.as_str()).unwrap_or(snap.album.as_str());
@@ -1724,10 +1847,35 @@ mod tests {
             frames: 1000,
             start_frame: start,
             sample_rate: 44100,
+            format_name: "FLAC".into(),
+            channels: 2,
+            bitrate_bps: 900_000,
+            bits_per_sample: 16,
             group: group.map(str::to_string),
             error: None,
             path: PathBuf::from("/music/album.flac"),
         }
+    }
+
+    #[test]
+    fn file_facts_read_as_player_labels() {
+        assert_eq!(format_sample_rate(44_100), "44.1 kHz");
+        assert_eq!(format_sample_rate(48_000), "48 kHz");
+        assert_eq!(format_sample_rate(0), "—");
+        assert_eq!(format_bitrate(320_000), "320 kbps");
+        assert_eq!(format_bitrate(320_400), "320 kbps");
+        assert_eq!(format_bitrate(0), "—");
+        assert_eq!(format_channels(1), "Mono");
+        assert_eq!(format_channels(2), "Stereo");
+        assert_eq!(format_channels(6), "5.1");
+        assert_eq!(format_bit_depth(24), "24-bit");
+        assert_eq!(format_bit_depth(0), "—");
+        assert_eq!(codec_label("FLAC", Path::new("album.flac")), "FLAC");
+        assert_eq!(codec_label("AAC", Path::new("book.m4a")), "AAC · M4A");
+        assert_eq!(codec_label("Vorbis", Path::new("track.ogg")), "Vorbis · OGG");
+        assert_eq!(codec_label("WavPack", Path::new("tape.wv")), "WavPack · WV");
+        assert_eq!(codec_label("AIFF", Path::new("take.aif")), "AIFF");
+        assert_eq!(codec_label("Audio", Path::new("mystery.wv")), "WV");
     }
 
     #[test]

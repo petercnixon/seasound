@@ -138,6 +138,12 @@ pub struct Source {
     pub format: AudioFormat,
     pub sample_rate: u32,
     pub channels: u16,
+    /// Average file bitrate in bits per second. Zero when the size or duration is unknown.
+    #[serde(default)]
+    pub bitrate_bps: u32,
+    /// Bits per coded sample for PCM and lossless codecs. Zero when the file does not say.
+    #[serde(default)]
+    pub bits_per_sample: u16,
     /// Encoder delay, in PCM frames. Zero when the file has no trim metadata.
     pub delay: u64,
     /// Encoder padding at the end, in PCM frames.

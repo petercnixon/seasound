@@ -96,6 +96,12 @@ fn source_from_plugin(path: &Path, facts: plugins::ProbeFacts) -> Source {
         format: AudioFormat::Other,
         sample_rate: facts.sample_rate,
         channels: facts.channels,
+        bitrate_bps: average_bitrate_bps(
+            file_len(path),
+            facts.presentation_frames,
+            facts.sample_rate,
+        ),
+        bits_per_sample: 0,
         delay: 0,
         padding: 0,
         presentation_frames: facts.presentation_frames,
@@ -362,12 +368,15 @@ fn probe_audio(path: &Path, cue: CueMode) -> Result<Source, Error> {
         .or(flac.as_ref().map(|meta| meta.disc))
         .unwrap_or(0);
 
+    let rate_frames = decoded.filter(|frames| *frames > 0).unwrap_or(presentation);
     let mut source = Source {
         id: SourceId(0),
         path: path.to_path_buf(),
         format: info.format,
         sample_rate,
         channels: info.channels.max(1),
+        bitrate_bps: average_bitrate_bps(file_len(path), rate_frames, sample_rate),
+        bits_per_sample: info.bits_per_sample,
         delay: trim.delay,
         padding: trim.padding,
         presentation_frames: presentation,
@@ -547,6 +556,7 @@ struct StreamInfo {
     format: AudioFormat,
     sample_rate: u32,
     channels: u16,
+    bits_per_sample: u16,
     decoded_frames: Option<u64>,
     he_aac: bool,
 }
@@ -593,9 +603,39 @@ fn stream_info(path: &Path) -> Result<StreamInfo, Error> {
             .channels
             .map(|channels| channels.count() as u16)
             .unwrap_or(0),
+        bits_per_sample: display_bits(audio_format, &track.codec_params),
         decoded_frames: track.codec_params.n_frames,
         he_aac,
     })
+}
+
+/// Bits to show for a PCM or lossless file. Lossy codecs leave this at zero.
+fn display_bits(format: AudioFormat, params: &symphonia::core::codecs::CodecParameters) -> u16 {
+    let coded = params.bits_per_coded_sample.filter(|bits| (8..=32).contains(bits));
+    let plain = params.bits_per_sample.filter(|bits| (8..=32).contains(bits));
+    let bits = match format {
+        AudioFormat::Flac | AudioFormat::Alac | AudioFormat::Wav | AudioFormat::Aiff => {
+            coded.or(plain)
+        }
+        _ => None,
+    };
+    bits.unwrap_or(0) as u16
+}
+
+/// `bytes * 8 * sample_rate / frames`, rounded to the nearest bit per second.
+fn average_bitrate_bps(bytes: u64, frames: u64, sample_rate: u32) -> u32 {
+    if bytes == 0 || frames == 0 || sample_rate == 0 {
+        return 0;
+    }
+    let product = (bytes as u128)
+        .saturating_mul(8)
+        .saturating_mul(u128::from(sample_rate));
+    let bps = product / u128::from(frames);
+    u32::try_from(bps).unwrap_or(u32::MAX)
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
 fn classify_codec(codec: CodecType, path: &Path) -> AudioFormat {
@@ -735,6 +775,8 @@ fn error_source(path: &Path, message: impl Into<String>) -> Source {
         format: AudioFormat::Other,
         sample_rate: 0,
         channels: 0,
+        bitrate_bps: 0,
+        bits_per_sample: 0,
         delay: 0,
         padding: 0,
         presentation_frames: 0,
@@ -823,6 +865,14 @@ mod tests {
             assert!(source.padding > 0, "{}", source.path.display());
             assert!(source.presentation_frames > source.sample_rate as u64);
             assert!(!source.title.is_empty(), "{}", source.path.display());
+            assert!(source.channels >= 1, "{}", source.path.display());
+            let kbps = source.bitrate_bps / 1000;
+            assert!(
+                (96..=360).contains(&kbps),
+                "{} bitrate {kbps} kbps",
+                source.path.display()
+            );
+            assert_eq!(source.bits_per_sample, 0, "{}", source.path.display());
         }
     }
 
@@ -850,6 +900,14 @@ mod tests {
         let last = source.segments.last().unwrap();
         assert_eq!(last.end_frame, source.presentation_frames);
         assert_eq!(source.delay, 0);
+        assert!(source.sample_rate >= 44100, "rate {}", source.sample_rate);
+        assert!(source.channels >= 1);
+        assert!(
+            source.bits_per_sample == 16 || source.bits_per_sample == 24,
+            "bits {}",
+            source.bits_per_sample
+        );
+        assert!(source.bitrate_bps > 200_000, "bitrate {}", source.bitrate_bps);
     }
 
     #[test]
@@ -883,5 +941,19 @@ mod tests {
         );
         assert_eq!(source.delay, 2112, "iTunSMPB priming");
         assert_eq!(source.padding, 0x190);
+        assert_eq!(source.format, AudioFormat::Aac);
+        assert!(source.channels >= 1);
+        assert_eq!(source.bits_per_sample, 0);
+        let kbps = source.bitrate_bps / 1000;
+        assert!((32..=512).contains(&kbps), "bitrate {kbps} kbps");
+    }
+
+    #[test]
+    fn average_bitrate_uses_file_size_and_duration() {
+        let bytes = 40_000;
+        let frames = 44_100;
+        assert_eq!(average_bitrate_bps(bytes, frames, 44_100), 320_000);
+        assert_eq!(average_bitrate_bps(0, frames, 44_100), 0);
+        assert_eq!(average_bitrate_bps(bytes, 0, 44_100), 0);
     }
 }
