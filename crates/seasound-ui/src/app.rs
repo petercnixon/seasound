@@ -683,7 +683,7 @@ impl SeaSoundApp {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_min_width(details_width);
-                        file_details(ui, row.as_ref());
+                        file_details(ui, row.as_ref(), &snap.rows);
                     },
                 );
             });
@@ -1639,7 +1639,7 @@ fn row_title(row: &RowView) -> String {
         .to_string()
 }
 
-fn file_details(ui: &mut egui::Ui, row: Option<&RowView>) {
+fn file_details(ui: &mut egui::Ui, row: Option<&RowView>, rows: &[RowView]) {
     let (codec, bitrate, rate, channels, bits) = match row {
         Some(row) => (
             codec_label(&row.format_name, &row.path),
@@ -1656,6 +1656,7 @@ fn file_details(ui: &mut egui::Ui, row: Option<&RowView>) {
             em_dash(),
         ),
     };
+    let playtime = playlist_playtime(rows);
     ui.add_space(2.0);
     egui::Grid::new("now-playing-details")
         .spacing(egui::vec2(18.0, 4.0))
@@ -1665,7 +1666,29 @@ fn file_details(ui: &mut egui::Ui, row: Option<&RowView>) {
             detail_line(ui, "Sample rate", &rate);
             detail_line(ui, "Channels", &channels);
             detail_line(ui, "Bit depth", &bits);
+            detail_line(ui, "Playtime", &playtime);
         });
+}
+
+/// Sum of each playlist row, using the same truncated seconds as the Time column.
+fn playlist_playtime(rows: &[RowView]) -> String {
+    if rows.is_empty() {
+        return em_dash();
+    }
+    let mut seconds = 0u64;
+    let mut known = false;
+    for row in rows {
+        if row.sample_rate == 0 {
+            continue;
+        }
+        known = true;
+        seconds = seconds.saturating_add(row.frames / u64::from(row.sample_rate));
+    }
+    if known {
+        format_time(seconds, 1)
+    } else {
+        em_dash()
+    }
 }
 
 fn detail_line(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -1942,6 +1965,26 @@ mod tests {
         assert_eq!(codec_label("WavPack", Path::new("tape.wv")), "WavPack · WV");
         assert_eq!(codec_label("AIFF", Path::new("take.aif")), "AIFF");
         assert_eq!(codec_label("Audio", Path::new("mystery.wv")), "WV");
+    }
+
+    #[test]
+    fn playlist_playtime_sums_each_row() {
+        let mut first = row(0, None, 0, "One");
+        first.frames = 44_100 * 90;
+        let mut second = row(1, None, 0, "Two");
+        second.frames = 48_000 * 30;
+        second.sample_rate = 48_000;
+        assert_eq!(playlist_playtime(&[first, second]), "2:00");
+
+        let mut unknown = row(0, None, 0, "Quiet");
+        unknown.sample_rate = 0;
+        unknown.frames = 44_100;
+        assert_eq!(playlist_playtime(&[unknown]), "—");
+        assert_eq!(playlist_playtime(&[]), "—");
+
+        let mut long = row(0, None, 0, "Long");
+        long.frames = 44_100 * (3600 + 125);
+        assert_eq!(playlist_playtime(&[long]), "1:02:05");
     }
 
     #[test]
