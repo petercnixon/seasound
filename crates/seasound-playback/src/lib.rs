@@ -7,7 +7,7 @@ mod engine;
 mod resample;
 
 pub use core::{CoreStats, PlayerCore, PullResult, SegmentJob};
-pub use engine::{Command, Engine, Opener, Snapshot};
+pub use engine::{Command, Engine, Opener, Snapshot, StartAt};
 
 #[cfg(feature = "cpal-output")]
 pub use device::device_names;

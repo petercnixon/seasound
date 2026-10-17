@@ -12,6 +12,9 @@ rubato = { version = "0.16", default-features = false }
 rtrb = "0.3"
 cpal = { version = "0.15", optional = true }
 
+[dev-dependencies]
+seasound-media = { workspace = true }
+
 [features]
 default = ["cpal-output"]
 cpal-output = ["dep:cpal"]

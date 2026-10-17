@@ -354,6 +354,36 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn a_seek_into_a_later_cue_track_is_not_the_start_of_that_track() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/FLAC with embedded CUE.flac");
+        if !path.is_file() {
+            return;
+        }
+        let probed = crate::probe::probe_file(&path);
+        assert!(probed.segments.len() > 1, "segments {}", probed.segments.len());
+        let segment = &probed.segments[1];
+        let into = (segment.frames() / 2).max(probed.sample_rate as u64);
+        let target = segment.start_frame + into.min(segment.frames().saturating_sub(1));
+        let params = DecodeParams::from(&probed);
+        let mut at_start = SymphoniaSource::open(&path, params).unwrap();
+        let mut at_target = SymphoniaSource::open(&path, params).unwrap();
+        at_start.seek_presentation(segment.start_frame).unwrap();
+        at_target.seek_presentation(target).unwrap();
+        let mut start_samples = vec![0f32; 32];
+        let mut target_samples = vec![0f32; 32];
+        let start_n = at_start.pull(&mut start_samples).unwrap();
+        let target_n = at_target.pull(&mut target_samples).unwrap();
+        assert!(start_n > 0 && target_n > 0);
+        assert_ne!(
+            &start_samples[..start_n.min(target_n) * probed.channels as usize],
+            &target_samples[..start_n.min(target_n) * probed.channels as usize],
+            "seek to {target} (track start {}) played the start of the track",
+            segment.start_frame
+        );
+    }
+
+    #[test]
     fn trimmed_mp3_matches_the_untrimmed_stream_after_the_delay() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/Gapless MP3 Album/101. Fatboy Slim - Gangster Trippin'.mp3");

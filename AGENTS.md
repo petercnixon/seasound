@@ -81,7 +81,7 @@ winit 0.30 emits no drop events on Wayland. `seasound-ui` forces the X11 backend
 
 ## Settings
 
-`directories::ProjectDirs::from("audio", "SeaSound", "SeaSound")`. The Linux path is lowercased, so it is `~/.config/seasound`. `settings.json` stores volume, mute, the output device, and `disabled_plugins`. `playlist.json` is the session list, written on autosave only after the window has shown rows. The window size is eframe's own persistence. A test launch must set `XDG_CONFIG_HOME` to a temp directory so it does not write the user's config.
+`directories::ProjectDirs::from("audio", "SeaSound", "SeaSound")`. The Linux path is lowercased, so it is `~/.config/seasound`. `settings.json` stores volume, mute, the output device, `disabled_plugins`, and `resume_playback` (default on). When resume is on, `session` stores the in-app playlist rows, the current track (`path` and `start_frame`), and `position_frames`. The next launch loads those rows and plays that track from that position. It does not reload a playlist file the user opened. An empty `session` means the playlist was cleared. With no `session` yet, startup still loads `playlist` from settings and does not autoplay. `playlist.json` is the session list, written on autosave only after the window has shown rows. The window size is eframe's own persistence. The Settings menu opens the settings modal. eframe's `persistence` feature is off, so `App::save` does not run. The window writes `settings.json` when a close is requested. A test launch must set `XDG_CONFIG_HOME` to a temp directory so it does not write the user's config.
 
 ## Examples and tests
 

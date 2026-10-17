@@ -13,7 +13,7 @@ use seasound_model::{
     format_time, load_saved_playlist, Cover, DecodeParams, PlayState, Playlist, Repeat, RowView,
     SavedPlaylist, SavedRow, Source, SourceId,
 };
-use seasound_playback::{Command, Engine, Opener, Snapshot};
+use seasound_playback::{Command, Engine, Opener, Snapshot, StartAt};
 use serde::{Deserialize, Serialize};
 
 const ROW_H: f32 = 28.0;
@@ -58,6 +58,10 @@ pub struct SeaSoundApp {
     device_pref: Option<String>,
     plugins: Vec<seasound_media::PluginStatus>,
     disabled_plugins: Vec<String>,
+    /// Remember the in-app playlist, track, and position across launches.
+    resume_playback: bool,
+    session: Option<SessionPlayback>,
+    settings_open: bool,
 }
 
 /// Replace clears the playlist. Append keeps what is already there.
@@ -78,11 +82,14 @@ enum Dialog {
 enum LoadWork {
     Paths { paths: Vec<PathBuf>, import: Import },
     SavedFile(PathBuf),
+    /// The playlist stored in settings, not a playlist file the user opened.
+    Session(SessionPlayback),
 }
 
 enum LoadDone {
     Sources { sources: Vec<Source>, import: Import },
     Saved { playlist: Playlist, path: PathBuf },
+    Session { playlist: Playlist, session: SessionPlayback },
     Failed(String),
 }
 
@@ -140,10 +147,36 @@ struct Settings {
     playlist: Option<PathBuf>,
     #[serde(default)]
     disabled_plugins: Vec<String>,
+    /// Play the saved in-app playlist from the saved position on the next launch.
+    #[serde(default = "default_resume_playback")]
+    resume_playback: bool,
+    /// Playlist, track, and position saved from the app. Absent when resume is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session: Option<SessionPlayback>,
+}
+
+/// The playlist that was in the app at exit, plus the track that was current.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct SessionPlayback {
+    rows: Vec<SavedRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    track: Option<ResumeTrack>,
+}
+
+/// Identity of the current row. The index is not stored: a missing file shifts the list.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ResumeTrack {
+    path: PathBuf,
+    start_frame: u64,
+    position_frames: u64,
 }
 
 fn default_volume() -> f32 {
     0.8
+}
+
+fn default_resume_playback() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -154,8 +187,20 @@ impl Default for Settings {
             device: None,
             playlist: None,
             disabled_plugins: Vec::new(),
+            resume_playback: default_resume_playback(),
+            session: None,
         }
     }
+}
+
+/// What to put in the window on launch.
+#[derive(Debug)]
+enum StartupLoad {
+    /// Rows saved in settings. `track` is played when it still matches a row.
+    Session(SessionPlayback),
+    /// A playlist path, loaded without starting playback.
+    File(PathBuf),
+    Empty,
 }
 
 impl SeaSoundApp {
@@ -213,11 +258,19 @@ impl SeaSoundApp {
             device_pref: settings.device,
             plugins,
             disabled_plugins: settings.disabled_plugins,
+            resume_playback: settings.resume_playback,
+            session: settings.session.clone(),
+            settings_open: false,
         };
-        if let Some(path) = settings.playlist {
-            if path.is_file() {
-                app.spawn(LoadWork::SavedFile(path));
+        match startup_load(settings.resume_playback, settings.session, settings.playlist) {
+            StartupLoad::Session(session) => {
+                // The saved rows are the playlist that was in the window, not the file
+                // from Open playlist or Save playlist.
+                app.playlist_path = None;
+                app.spawn(LoadWork::Session(session));
             }
+            StartupLoad::File(path) => app.spawn(LoadWork::SavedFile(path)),
+            StartupLoad::Empty => {}
         }
         app
     }
@@ -252,13 +305,22 @@ impl SeaSoundApp {
                 Import::Replace => self.install_sources(sources, true),
                 Import::Append => self.append_sources(sources),
             },
-            LoadDone::Saved { playlist, path } => self.install_playlist(playlist, false, Some(path)),
+            LoadDone::Saved { playlist, path } => {
+                self.install_playlist(playlist, false, Some(path), None)
+            }
+            LoadDone::Session { playlist, session } => {
+                let start = session
+                    .track
+                    .as_ref()
+                    .and_then(|track| resume_start(&playlist, track));
+                self.install_playlist(playlist, false, None, start);
+            }
             LoadDone::Failed(message) => self.notice = Some(message),
         }
     }
 
     fn install_sources(&mut self, sources: Vec<Source>, autoplay: bool) {
-        self.install_playlist(Playlist::new(sources), autoplay, None);
+        self.install_playlist(Playlist::new(sources), autoplay, None, None);
     }
 
     fn append_sources(&mut self, sources: Vec<Source>) {
@@ -291,11 +353,21 @@ impl SeaSoundApp {
         self.row_drag = None;
     }
 
-    fn install_playlist(&mut self, mut playlist: Playlist, autoplay: bool, path: Option<PathBuf>) {
+    fn install_playlist(
+        &mut self,
+        mut playlist: Playlist,
+        autoplay: bool,
+        path: Option<PathBuf>,
+        start: Option<StartAt>,
+    ) {
         let (covers, warnings) = take_art(&mut playlist);
         let repeat = self.snap.repeat;
         let shuffle = self.snap.shuffle;
-        self.engine.command(Command::SetPlaylist { playlist, autoplay });
+        self.engine.command(Command::SetPlaylist {
+            playlist,
+            autoplay,
+            start,
+        });
         self.engine.command(Command::SetRepeat(repeat));
         self.engine.command(Command::SetShuffle(shuffle));
         self.covers = covers;
@@ -554,8 +626,55 @@ impl SeaSoundApp {
                         self.write_settings();
                     }
                 });
+                ui.menu_button("Settings", |ui| {
+                    if ui.button("Settings…").clicked() {
+                        self.settings_open = true;
+                        ui.close_menu();
+                    }
+                });
             });
         });
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let frame = egui::Frame::window(&ctx.style()).inner_margin(16);
+        let shown = egui::Modal::new(egui::Id::new("settings"))
+            .frame(frame)
+            .backdrop_color(egui::Color32::from_black_alpha(160))
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.set_max_width(440.0);
+                ui.label(egui::RichText::new("Settings").strong().size(18.0));
+                ui.add_space(12.0);
+                let mut resume = self.resume_playback;
+                if ui.checkbox(&mut resume, "Resume playback").changed() {
+                    self.resume_playback = resume;
+                    if resume {
+                        self.capture_session();
+                    } else {
+                        self.session = None;
+                    }
+                    self.write_settings();
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "On exit, SeaSound saves the playlist in the app, the current track, and the position. The next launch plays that track from the saved position. This is the playlist in the window, not a playlist file you opened.",
+                    )
+                    .size(13.0)
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(14.0);
+                if ui.button("Close").clicked() {
+                    self.settings_open = false;
+                }
+            });
+        if shown.should_close() {
+            self.settings_open = false;
+        }
     }
 
     fn transport(&mut self, ctx: &egui::Context) {
@@ -1245,6 +1364,12 @@ impl SeaSoundApp {
             device,
             playlist: self.playlist_path.clone(),
             disabled_plugins: self.disabled_plugins.clone(),
+            resume_playback: self.resume_playback,
+            session: if self.resume_playback {
+                self.session.clone()
+            } else {
+                None
+            },
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1273,6 +1398,28 @@ impl SeaSoundApp {
             self.playlist_path = Some(path);
         }
     }
+
+    /// Remember the playlist currently in the window. Skipped while a load is in flight
+    /// so a late save cannot replace a good session with an empty list.
+    fn capture_session(&mut self) {
+        if !self.resume_playback {
+            self.session = None;
+            return;
+        }
+        if self.loading || !self.seen_rows {
+            return;
+        }
+        let rows = saved_from_rows(&self.snap.rows).rows;
+        let track = self.snap.index.and_then(|index| {
+            let row = self.snap.rows.get(index)?;
+            Some(ResumeTrack {
+                path: row.path.clone(),
+                start_frame: row.start_frame,
+                position_frames: self.snap.position_frames,
+            })
+        });
+        self.session = Some(SessionPlayback { rows, track });
+    }
 }
 
 impl eframe::App for SeaSoundApp {
@@ -1281,6 +1428,11 @@ impl eframe::App for SeaSoundApp {
         if !self.snap.rows.is_empty() {
             self.seen_rows = true;
         }
+        // eframe only calls `App::save` when its persistence feature is on, and that
+        // feature is not enabled. The close request is delivered on this frame.
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.persist();
+        }
         self.poll_load();
         self.take_drops(ctx);
         self.handle_keys(ctx);
@@ -1288,6 +1440,7 @@ impl eframe::App for SeaSoundApp {
         self.menu(ctx);
         self.transport(ctx);
         self.playlist_panel(ctx);
+        self.settings_window(ctx);
         self.arm_dialog(ctx);
         if self.loading
             || self.snap.state == PlayState::Playing
@@ -1303,10 +1456,17 @@ impl eframe::App for SeaSoundApp {
     }
 
     fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.persist();
+    }
+}
+
+impl SeaSoundApp {
+    fn persist(&mut self) {
         self.snap = self.engine.snapshot();
         if !self.snap.rows.is_empty() {
             self.seen_rows = true;
         }
+        self.capture_session();
         self.autosave_playlist();
         self.write_settings();
     }
@@ -1326,6 +1486,16 @@ impl LoadWork {
                 },
                 Err(err) => LoadDone::Failed(err.to_string()),
             },
+            LoadWork::Session(session) => {
+                let saved = SavedPlaylist {
+                    version: 1,
+                    rows: session.rows.clone(),
+                };
+                LoadDone::Session {
+                    playlist: playlist_from_saved(&saved),
+                    session,
+                }
+            }
         }
     }
 }
@@ -1348,6 +1518,10 @@ fn opener() -> Opener {
 
 fn playlist_from_text(text: &str) -> Result<Playlist, String> {
     let saved = SavedPlaylist::from_json(text).map_err(|err| err.to_string())?;
+    Ok(playlist_from_saved(&saved))
+}
+
+fn playlist_from_saved(saved: &SavedPlaylist) -> Playlist {
     let mut paths = Vec::new();
     for row in &saved.rows {
         if !paths.iter().any(|path| path == &row.path) {
@@ -1355,7 +1529,45 @@ fn playlist_from_text(text: &str) -> Result<Playlist, String> {
         }
     }
     let probed = seasound_media::load_paths(&paths);
-    Ok(load_saved_playlist(&saved, probed))
+    load_saved_playlist(saved, probed)
+}
+
+/// Resume uses the playlist saved in settings. A playlist file path is only a fallback
+/// for a launch that has no saved session, and it does not start playback.
+fn startup_load(
+    resume_playback: bool,
+    session: Option<SessionPlayback>,
+    opened: Option<PathBuf>,
+) -> StartupLoad {
+    if resume_playback {
+        if let Some(session) = session {
+            if session.rows.is_empty() {
+                return StartupLoad::Empty;
+            }
+            return StartupLoad::Session(session);
+        }
+    }
+    if let Some(path) = opened {
+        if path.is_file() {
+            return StartupLoad::File(path);
+        }
+    }
+    StartupLoad::Empty
+}
+
+fn resume_start(playlist: &Playlist, track: &ResumeTrack) -> Option<StartAt> {
+    let rows = playlist.rows();
+    let position = rows
+        .iter()
+        .position(|row| row.path == track.path && row.start_frame == track.start_frame)?;
+    let frames = rows.get(position).map(|row| row.frames).unwrap_or(0);
+    let fraction = if frames == 0 {
+        0.0
+    } else {
+        (track.position_frames as f32 / frames as f32).clamp(0.0, 0.999)
+    };
+    let index = rows.get(position).map(|row| row.index)?;
+    Some(StartAt { index, fraction })
 }
 
 fn take_art(playlist: &mut Playlist) -> (HashMap<SourceId, Cover>, HashMap<SourceId, String>) {
@@ -2079,5 +2291,172 @@ mod tests {
         assert_eq!(ghost_text(&rows, &selected), "Breathe");
         selected.insert(4);
         assert_eq!(ghost_text(&rows, &selected), "2 tracks");
+    }
+
+    fn chaptered(path: &str) -> Source {
+        Source {
+            id: SourceId(0),
+            path: PathBuf::from(path),
+            format: seasound_model::AudioFormat::Flac,
+            sample_rate: 44100,
+            channels: 2,
+            bitrate_bps: 0,
+            bits_per_sample: 16,
+            delay: 0,
+            padding: 0,
+            presentation_frames: 2000,
+            artist: String::new(),
+            album: String::new(),
+            title: String::new(),
+            disc: 1,
+            track_number: 1,
+            segments: vec![
+                seasound_model::Segment {
+                    number: 1,
+                    title: "One".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    start_frame: 0,
+                    end_frame: 1000,
+                },
+                seasound_model::Segment {
+                    number: 2,
+                    title: "Two".into(),
+                    artist: String::new(),
+                    album: String::new(),
+                    start_frame: 1000,
+                    end_frame: 2000,
+                },
+            ],
+            group_title: Some("Album".into()),
+            error: None,
+            warning: None,
+            format_label: String::new(),
+            cover: None,
+        }
+    }
+
+    #[test]
+    fn resume_finds_the_chapter_and_clamps_the_fraction() {
+        let playlist = Playlist::new(vec![chaptered("/music/album.flac")]);
+        let start = resume_start(
+            &playlist,
+            &ResumeTrack {
+                path: "/music/album.flac".into(),
+                start_frame: 1000,
+                position_frames: 250,
+            },
+        )
+        .expect("chapter");
+        assert_eq!(start.index, 1);
+        assert!((start.fraction - 0.25).abs() < 0.000_1);
+        assert!(resume_start(
+            &playlist,
+            &ResumeTrack {
+                path: "/music/other.flac".into(),
+                start_frame: 0,
+                position_frames: 10,
+            },
+        )
+        .is_none());
+        let clamped = resume_start(
+            &playlist,
+            &ResumeTrack {
+                path: "/music/album.flac".into(),
+                start_frame: 0,
+                position_frames: 50_000,
+            },
+        )
+        .expect("first chapter");
+        assert_eq!(clamped.index, 0);
+        assert_eq!(clamped.fraction, 0.999);
+    }
+
+    #[test]
+    fn resume_uses_the_saved_app_playlist_not_an_opened_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "seasound-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = dir.join("opened.json");
+        std::fs::write(&opened, "{\"version\":1,\"rows\":[]}").unwrap();
+        let session = SessionPlayback {
+            rows: vec![SavedRow {
+                path: PathBuf::from("/music/in-app.flac"),
+                start_frame: 0,
+                title: "In app".into(),
+            }],
+            track: Some(ResumeTrack {
+                path: PathBuf::from("/music/in-app.flac"),
+                start_frame: 0,
+                position_frames: 10,
+            }),
+        };
+        match startup_load(true, Some(session.clone()), Some(opened.clone())) {
+            StartupLoad::Session(got) => {
+                assert_eq!(got.rows[0].path, PathBuf::from("/music/in-app.flac"));
+            }
+            other => panic!("expected the in-app playlist, got {other:?}"),
+        }
+        match startup_load(false, Some(session), Some(opened.clone())) {
+            StartupLoad::File(path) => assert_eq!(path, opened),
+            other => panic!("expected the opened file, got {other:?}"),
+        }
+        match startup_load(true, None, Some(opened.clone())) {
+            StartupLoad::File(path) => assert_eq!(path, opened),
+            other => panic!("expected the saved path before a session exists, got {other:?}"),
+        }
+        let cleared = SessionPlayback {
+            rows: Vec::new(),
+            track: None,
+        };
+        match startup_load(true, Some(cleared), Some(opened)) {
+            StartupLoad::Empty => {}
+            other => panic!("a cleared playlist should not reopen a file, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_roundtrip_keeps_resume_and_old_files_default_it_on() {
+        let parsed: Settings = serde_json::from_str(r#"{"volume":0.4,"muted":true}"#).unwrap();
+        assert!(parsed.resume_playback);
+        assert!(parsed.session.is_none());
+        assert!((parsed.volume - 0.4).abs() < f32::EPSILON);
+        let session = SessionPlayback {
+            rows: vec![SavedRow {
+                path: PathBuf::from("/music/in-app.flac"),
+                start_frame: 5,
+                title: "A".into(),
+            }],
+            track: Some(ResumeTrack {
+                path: PathBuf::from("/music/in-app.flac"),
+                start_frame: 5,
+                position_frames: 12,
+            }),
+        };
+        let stored = Settings {
+            resume_playback: true,
+            session: Some(session.clone()),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&stored).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session, Some(session));
+        assert!(back.resume_playback);
+        let off = Settings {
+            resume_playback: false,
+            session: None,
+            ..Settings::default()
+        };
+        let off_json = serde_json::to_string(&off).unwrap();
+        assert!(!off_json.contains("session"));
+        let off_back: Settings = serde_json::from_str(&off_json).unwrap();
+        assert!(!off_back.resume_playback);
     }
 }

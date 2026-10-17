@@ -269,7 +269,7 @@ pub struct SavedPlaylist {
     pub rows: Vec<SavedRow>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedRow {
     pub path: PathBuf,
     pub start_frame: u64,

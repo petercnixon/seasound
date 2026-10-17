@@ -60,8 +60,21 @@ impl Default for Snapshot {
     }
 }
 
+/// A row to start, and how far into that row, from 0 to just under 1.
+#[derive(Clone, Copy, Debug)]
+pub struct StartAt {
+    pub index: usize,
+    pub fraction: f32,
+}
+
 pub enum Command {
-    SetPlaylist { playlist: Playlist, autoplay: bool },
+    /// Replace the playlist. `start` plays that row from a fraction of its length.
+    /// With no `start`, `autoplay` starts the first playable row.
+    SetPlaylist {
+        playlist: Playlist,
+        autoplay: bool,
+        start: Option<StartAt>,
+    },
     /// Add rows. Playback of the current file continues.
     Append(Playlist),
     Clear,
@@ -243,10 +256,22 @@ fn playback_thread(
 fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool {
     match command {
         Command::Shutdown => return true,
-        Command::SetPlaylist { playlist, autoplay } => {
+        Command::SetPlaylist {
+            playlist,
+            autoplay,
+            start,
+        } => {
             deck.install(playlist);
             deck.halt(output);
-            if autoplay {
+            if let Some(start) = start {
+                if deck.playable(start.index) {
+                    deck.seek_fraction(start.index, start.fraction, output);
+                } else if autoplay {
+                    if let Some(index) = deck.first_playable() {
+                        deck.begin(index, output);
+                    }
+                }
+            } else if autoplay {
                 if let Some(index) = deck.first_playable() {
                     deck.begin(index, output);
                 }
@@ -559,9 +584,9 @@ impl Deck {
         self.spans.clear();
         self.queued = 0;
         self.origin = output.played();
-        let _ = fraction;
-        // The fraction is applied by shifting the segment job. Store it on the cursor
-        // via a side channel: the next fill reads `seek_frame`.
+        // The fraction shifts the segment job. Leave it set until a fill has a decoder.
+        // A same-file cue prefetch makes the first open come back later; taking the
+        // frame on that attempt would start at the cue point.
         self.seek_frame = Some(self.frame_for(index, fraction));
     }
 
@@ -595,6 +620,11 @@ impl Deck {
                     frames: written,
                     waiting: true,
                 });
+            }
+            // `job` already captured `seek_frame`. Drop it only now, so a fill that
+            // had to wait for the decoder builds the same job again.
+            if self.cursor.index() == Some(index) {
+                self.seek_frame = None;
             }
             let flush = !self.continues_after(index);
             let pulled = self.core.pull(job, &mut out[written * 2..], flush)?;
@@ -652,7 +682,7 @@ impl Deck {
         let mut start = segment.start_frame;
         let end = segment.end_frame;
         if self.cursor.index() == Some(index) {
-            if let Some(frame) = self.seek_frame.take() {
+            if let Some(frame) = self.seek_frame {
                 if frame >= start && frame < end {
                     start = frame;
                 }
@@ -1039,6 +1069,251 @@ mod tests {
         }
     }
 
+    fn cue_like(path: &str, ranges: &[(u64, u64)]) -> Source {
+        let end = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+        let mut source = source(path, end);
+        source.segments = ranges
+            .iter()
+            .enumerate()
+            .map(|(index, (start, end))| Segment {
+                number: (index + 1) as u32,
+                title: format!("Track {}", index + 1),
+                artist: "Artist".into(),
+                album: "Album".into(),
+                start_frame: *start,
+                end_frame: *end,
+            })
+            .collect();
+        source.presentation_frames = end;
+        source
+    }
+
+    #[test]
+    fn a_cue_track_can_start_in_the_middle_of_its_range() {
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let opener: Opener = Arc::new(|source| {
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let engine = Engine::start_with(opener, Box::new(memory));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![cue_like(
+                "album.flac",
+                &[(0, 100_000), (100_000, 200_000)],
+            )]),
+            autoplay: false,
+            start: Some(StartAt {
+                index: 1,
+                fraction: 0.5,
+            }),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let ready = recorded.lock().unwrap().len() >= 2;
+            if ready {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                let snapshot = engine.snapshot();
+                panic!(
+                    "cue track produced no audio: {:?} {}",
+                    snapshot.state,
+                    snapshot.error.unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let first = recorded.lock().unwrap()[0];
+        assert!(
+            (first - 150_000.0).abs() < 2.0,
+            "started at {first}, expected the middle of the second cue track"
+        );
+        assert_eq!(engine.snapshot().title, "Track 2");
+    }
+
+    /// The row after the resumed cue track is the same file, so opening it is the
+    /// prefetch already in flight. The start position has to survive that wait.
+    #[test]
+    fn a_cue_seek_survives_the_same_file_prefetch() {
+        struct Gate {
+            entered: bool,
+            release: bool,
+        }
+        let gate = Arc::new((Mutex::new(Gate { entered: false, release: false }), std::sync::Condvar::new()));
+        let entered = Arc::clone(&gate);
+        let opener: Opener = Arc::new(move |source| {
+            let (lock, cv) = &*entered;
+            let mut guard = lock.lock().unwrap();
+            if !guard.entered {
+                guard.entered = true;
+                cv.notify_all();
+                while !guard.release {
+                    guard = cv.wait(guard).unwrap();
+                }
+            }
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let engine = Engine::start_with(opener, Box::new(memory));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![cue_like(
+                "album.flac",
+                &[(0, 100_000), (100_000, 200_000), (200_000, 300_000)],
+            )]),
+            autoplay: false,
+            start: Some(StartAt {
+                index: 1,
+                fraction: 0.5,
+            }),
+        });
+        {
+            let (lock, cv) = &*gate;
+            let mut guard = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !guard.entered {
+                let now = std::time::Instant::now();
+                if now > deadline {
+                    panic!("prefetch never opened the cue file");
+                }
+                let (next, _) = cv.wait_timeout(guard, deadline - now).unwrap();
+                guard = next;
+            }
+            // The playback thread needs a turn to notice the open is still in flight.
+            drop(guard);
+            thread::sleep(Duration::from_millis(50));
+            let mut guard = lock.lock().unwrap();
+            guard.release = true;
+            cv.notify_all();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if recorded.lock().unwrap().len() >= 2 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                let snapshot = engine.snapshot();
+                panic!(
+                    "cue track produced no audio: {:?} {}",
+                    snapshot.state,
+                    snapshot.error.unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let first = recorded.lock().unwrap()[0];
+        assert!(
+            (first - 150_000.0).abs() < 2.0,
+            "started at {first}, expected the middle of the second cue track"
+        );
+    }
+
+    #[test]
+    fn a_real_cue_flac_does_not_resume_at_the_start_of_the_track() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/FLAC with embedded CUE.flac");
+        if !path.is_file() {
+            return;
+        }
+        let probed = seasound_media::probe_file(&path);
+        assert!(
+            probed.segments.len() > 2,
+            "need a following cue row, got {}",
+            probed.segments.len()
+        );
+        let opener: Opener = Arc::new(|source| {
+            seasound_media::open_decoder(source.path.as_path(), seasound_model::DecodeParams::from(source))
+        });
+        let play = |fraction: f32| -> Vec<f32> {
+            let memory = MemoryOutput::new(44100);
+            let recorded = memory.samples_handle();
+            let engine = Engine::start_with(Arc::clone(&opener), Box::new(memory));
+            engine.command(Command::SetPlaylist {
+                playlist: Playlist::new(vec![probed.clone()]),
+                autoplay: false,
+                start: Some(StartAt { index: 1, fraction }),
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            loop {
+                if recorded.lock().unwrap().len() >= 64 {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    let snapshot = engine.snapshot();
+                    panic!(
+                        "no audio at fraction {fraction}: {:?} {}",
+                        snapshot.state,
+                        snapshot.error.unwrap_or_default()
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let samples = recorded.lock().unwrap()[..64].to_vec();
+            samples
+        };
+        let at_start = play(0.0);
+        let in_the_middle = play(0.5);
+        assert_ne!(
+            at_start, in_the_middle,
+            "resuming halfway through the second cue track played its beginning"
+        );
+    }
+
+    #[test]
+    fn a_playlist_can_start_on_a_later_track_and_position() {
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let opener: Opener = Arc::new(|source| {
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let engine = Engine::start_with(opener, Box::new(memory));
+        let frames = 44_100 * 10;
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("a", frames), source("b", frames)]),
+            autoplay: false,
+            start: Some(StartAt {
+                index: 1,
+                fraction: 0.5,
+            }),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let ready = recorded.lock().unwrap().len() >= 2;
+            // Memory output accepts audio as fast as it is decoded, so the track can
+            // finish before this loop observes Playing.
+            if snapshot.index == Some(1) && ready {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "did not resume: state {:?} index {:?} samples {} {}",
+                    snapshot.state,
+                    snapshot.index,
+                    recorded.lock().unwrap().len(),
+                    snapshot.error.unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let samples = recorded.lock().unwrap();
+        let first = samples[0];
+        assert!(
+            first > (frames / 4) as f32,
+            "playback started at {first}, not halfway through the second track"
+        );
+        assert_eq!(engine.snapshot().title, "b");
+    }
+
     #[test]
     fn the_engine_plays_two_files_back_to_back() {
         let memory = MemoryOutput::new(44100);
@@ -1054,6 +1329,7 @@ mod tests {
         engine.command(Command::SetPlaylist {
             playlist,
             autoplay: true,
+            start: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1095,6 +1371,7 @@ mod tests {
         engine.command(Command::SetPlaylist {
             playlist: first,
             autoplay: true,
+            start: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1111,6 +1388,7 @@ mod tests {
         engine.command(Command::SetPlaylist {
             playlist: second,
             autoplay: true,
+            start: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1159,6 +1437,7 @@ mod tests {
         engine.command(Command::SetPlaylist {
             playlist: Playlist::new(vec![source("first.flac", u64::MAX / 4)]),
             autoplay: true,
+            start: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1217,6 +1496,7 @@ mod tests {
                 source("c.flac", u64::MAX / 4),
             ]),
             autoplay: true,
+            start: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1353,6 +1633,7 @@ mod tests {
         engine.command(Command::SetPlaylist {
             playlist: Playlist::new(vec![source("long.flac", 44100 * 30)]),
             autoplay: true,
+            start: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut started = false;
@@ -1400,6 +1681,7 @@ mod tests {
         engine.command(Command::SetPlaylist {
             playlist: Playlist::new(vec![source("held.wav", 1000)]),
             autoplay: true,
+            start: None,
         });
         thread::sleep(Duration::from_millis(150));
         let snapshot = engine.snapshot();
@@ -1484,6 +1766,7 @@ mod tests {
         engine.command(Command::SetPlaylist {
             playlist: Playlist::new(vec![source("a", 88_200), source("b", 17_640)]),
             autoplay: true,
+            start: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(6);
         loop {
@@ -1531,6 +1814,7 @@ mod tests {
                 source("c", u64::MAX / 4),
             ]),
             autoplay: true,
+            start: None,
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
