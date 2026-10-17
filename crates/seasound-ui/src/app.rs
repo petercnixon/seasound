@@ -797,6 +797,15 @@ impl SeaSoundApp {
             ui.separator();
             ui.spacing_mut().item_spacing.y = 0.0;
             let lines = playlist_lines(&rows);
+            let scroll_style = ui.spacing().scroll;
+            // Floating bars are painted over the rows. Their clicks must not select or drag.
+            let bar_inset = vertical_bar_inset(
+                scroll_style.floating,
+                lines.len() as f32 * ROW_H,
+                ui.available_height(),
+                scroll_style.bar_width,
+                scroll_style.bar_outer_margin,
+            );
             let mut scroll = egui::ScrollArea::vertical()
                 .id_salt("playlist")
                 .auto_shrink([false, false])
@@ -819,9 +828,9 @@ impl SeaSoundApp {
                         response,
                     });
                 }
-                let cursor = self.handle_row_pointer(ctx, &rows, &slots);
+                let cursor = self.handle_row_pointer(ctx, &rows, &slots, bar_inset);
                 for slot in &slots {
-                    self.paint_slot(ui, &rows, slot, playing);
+                    self.paint_slot(ui, &rows, slot, playing, bar_inset);
                 }
                 self.paint_insertion(ui, &rows, &slots);
                 cursor
@@ -839,6 +848,7 @@ impl SeaSoundApp {
         ctx: &egui::Context,
         rows: &[RowView],
         slots: &[Slot],
+        bar_inset: f32,
     ) -> Option<egui::CursorIcon> {
         for slot in slots {
             if !slot.response.double_clicked() {
@@ -872,7 +882,7 @@ impl SeaSoundApp {
         let mut started = false;
         if pressed {
             if let Some(pos) = pointer {
-                if let Some((position, index)) = hit_track(pos, rows, slots) {
+                if let Some((position, index)) = hit_track(pos, rows, slots, bar_inset) {
                     started = true;
                     if self.selected.contains(&index) {
                         self.row_drag = Some(RowDrag {
@@ -897,7 +907,7 @@ impl SeaSoundApp {
         }
 
         let Some(mut drag) = self.row_drag else {
-            return hover_cursor(&self.selected, rows, slots);
+            return hover_cursor(&self.selected, rows, slots, bar_inset);
         };
         if !started {
             drag.travel += delta;
@@ -923,7 +933,7 @@ impl SeaSoundApp {
         if down {
             let icon = match drag.gesture {
                 RowGesture::Move { .. } if drag.travel > DRAG_SLOP => Some(egui::CursorIcon::Grabbing),
-                RowGesture::Move { .. } => hover_cursor(&self.selected, rows, slots),
+                RowGesture::Move { .. } => hover_cursor(&self.selected, rows, slots, bar_inset),
                 RowGesture::Select { .. } => None,
             };
             self.row_drag = Some(drag);
@@ -938,7 +948,7 @@ impl SeaSoundApp {
             };
             self.selected.clear();
             self.selected.insert(pressed_index);
-            return hover_cursor(&self.selected, rows, slots);
+            return hover_cursor(&self.selected, rows, slots, bar_inset);
         }
         if let RowGesture::Move { .. } = drag.gesture {
             self.commit_move(rows, drag.insert_before);
@@ -963,7 +973,14 @@ impl SeaSoundApp {
         self.settle = 15;
     }
 
-    fn paint_slot(&mut self, ui: &mut egui::Ui, rows: &[RowView], slot: &Slot, playing_index: Option<usize>) {
+    fn paint_slot(
+        &mut self,
+        ui: &mut egui::Ui,
+        rows: &[RowView],
+        slot: &Slot,
+        playing_index: Option<usize>,
+        bar_inset: f32,
+    ) {
         let rect = slot.rect;
         match &slot.line {
             Line::Header(title) => {
@@ -986,7 +1003,7 @@ impl SeaSoundApp {
                 let moving = self.row_drag.is_some_and(|drag| {
                     drag.travel > DRAG_SLOP && matches!(drag.gesture, RowGesture::Move { .. })
                 });
-                let fill = row_highlight(playing, selected, slot.response.hovered());
+                let fill = row_highlight(playing, selected, pointer_on_row(slot, bar_inset));
                 if let Some(fill) = fill {
                     ui.painter().rect_filled(rect, 0.0, fill);
                 }
@@ -1369,9 +1386,14 @@ fn saved_from_rows(rows: &[RowView]) -> SavedPlaylist {
     }
 }
 
-fn hit_track(pos: egui::Pos2, rows: &[RowView], slots: &[Slot]) -> Option<(usize, usize)> {
+fn hit_track(
+    pos: egui::Pos2,
+    rows: &[RowView],
+    slots: &[Slot],
+    bar_inset: f32,
+) -> Option<(usize, usize)> {
     for slot in slots {
-        if !slot.rect.contains(pos) {
+        if !row_hit_rect(slot.rect, bar_inset).contains(pos) {
             continue;
         }
         let Line::Track(position) = &slot.line else {
@@ -1404,9 +1426,41 @@ fn track_spans(rows: &[RowView], slots: &[Slot]) -> Vec<TrackSpan> {
     spans
 }
 
-fn hover_cursor(selected: &HashSet<usize>, rows: &[RowView], slots: &[Slot]) -> Option<egui::CursorIcon> {
+/// Width of a floating vertical scrollbar painted on top of the rows.
+/// Solid bars already sit outside the content, so they need no inset.
+fn vertical_bar_inset(
+    floating: bool,
+    content_height: f32,
+    viewport_height: f32,
+    bar_width: f32,
+    outer_margin: f32,
+) -> f32 {
+    if floating && content_height > viewport_height {
+        outer_margin + bar_width
+    } else {
+        0.0
+    }
+}
+
+fn row_hit_rect(rect: egui::Rect, bar_inset: f32) -> egui::Rect {
+    let right = (rect.right() - bar_inset).max(rect.left());
+    egui::Rect::from_min_max(rect.min, egui::pos2(right, rect.bottom()))
+}
+
+fn pointer_on_row(slot: &Slot, bar_inset: f32) -> bool {
+    slot.response
+        .hover_pos()
+        .is_some_and(|pos| row_hit_rect(slot.rect, bar_inset).contains(pos))
+}
+
+fn hover_cursor(
+    selected: &HashSet<usize>,
+    rows: &[RowView],
+    slots: &[Slot],
+    bar_inset: f32,
+) -> Option<egui::CursorIcon> {
     let hover = slots.iter().any(|slot| {
-        if !slot.response.hovered() {
+        if !pointer_on_row(slot, bar_inset) {
             return false;
         }
         let Line::Track(position) = &slot.line else {
@@ -1928,6 +1982,18 @@ mod tests {
             top,
             bottom: top + ROW_H,
         }
+    }
+
+    #[test]
+    fn scrollbar_gutter_is_not_a_row_click() {
+        let row = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, ROW_H));
+        let gutter = vertical_bar_inset(true, 30.0 * ROW_H, 400.0, 10.0, 0.0);
+        assert_eq!(gutter, 10.0);
+        assert!(row_hit_rect(row, gutter).contains(egui::pos2(189.0, 10.0)));
+        assert!(!row_hit_rect(row, gutter).contains(egui::pos2(191.0, 10.0)));
+        assert_eq!(vertical_bar_inset(true, 200.0, 400.0, 10.0, 0.0), 0.0);
+        assert!(row_hit_rect(row, 0.0).contains(egui::pos2(199.0, 10.0)));
+        assert_eq!(vertical_bar_inset(false, 30.0 * ROW_H, 400.0, 10.0, 4.0), 0.0);
     }
 
     #[test]
