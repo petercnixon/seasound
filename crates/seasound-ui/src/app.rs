@@ -26,6 +26,9 @@ const BG: egui::Color32 = egui::Color32::from_rgb(0x0e, 0x14, 0x18);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(0x14, 0x1c, 0x22);
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x20, 0xa8, 0x9c);
 const ERROR: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x78, 0x70);
+// Light fills so the row text can use the window background and stay readable.
+const ROW_SELECTED: egui::Color32 = egui::Color32::from_rgb(0x5d, 0xce, 0xc3);
+const ROW_HOVER: egui::Color32 = egui::Color32::from_rgb(0xa8, 0xdd, 0xd6);
 
 pub struct SeaSoundApp {
     engine: Engine,
@@ -983,29 +986,26 @@ impl SeaSoundApp {
                 let moving = self.row_drag.is_some_and(|drag| {
                     drag.travel > DRAG_SLOP && matches!(drag.gesture, RowGesture::Move { .. })
                 });
+                let fill = row_highlight(playing, selected, slot.response.hovered());
+                if let Some(fill) = fill {
+                    ui.painter().rect_filled(rect, 0.0, fill);
+                }
                 if playing {
-                    ui.painter().rect_filled(
-                        rect,
-                        0.0,
-                        egui::Color32::from_rgba_unmultiplied(0x20, 0xa8, 0x9c, 56),
-                    );
                     let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 3.0, rect.bottom()));
-                    ui.painter().rect_filled(bar, 0.0, ACCENT);
-                } else if selected {
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_white_alpha(32));
-                } else if slot.response.hovered() {
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_white_alpha(14));
+                    ui.painter().rect_filled(bar, 0.0, BG);
                 }
                 if moving && selected {
                     ui.painter().rect_stroke(
                         rect,
                         0.0,
-                        egui::Stroke::new(1.0, ACCENT),
+                        egui::Stroke::new(1.0, BG),
                         egui::StrokeKind::Inside,
                     );
                 }
                 let columns = columns_for(rect);
-                let color = if row.error.is_some() {
+                let color = if fill.is_some() {
+                    BG
+                } else if row.error.is_some() {
                     ERROR
                 } else {
                     ui.visuals().text_color()
@@ -1539,6 +1539,18 @@ fn paint_ghost(ctx: &egui::Context, pointer: egui::Pos2, label: &str) {
     painter.galley(rect.min + pad, galley, egui::Color32::WHITE);
 }
 
+fn row_highlight(playing: bool, selected: bool, hovered: bool) -> Option<egui::Color32> {
+    if playing {
+        Some(ACCENT)
+    } else if selected {
+        Some(ROW_SELECTED)
+    } else if hovered {
+        Some(ROW_HOVER)
+    } else {
+        None
+    }
+}
+
 fn playlist_lines(rows: &[RowView]) -> Vec<Line> {
     let mut lines = Vec::new();
     for (position, row) in rows.iter().enumerate() {
@@ -1876,6 +1888,14 @@ mod tests {
         assert_eq!(codec_label("WavPack", Path::new("tape.wv")), "WavPack · WV");
         assert_eq!(codec_label("AIFF", Path::new("take.aif")), "AIFF");
         assert_eq!(codec_label("Audio", Path::new("mystery.wv")), "WV");
+    }
+
+    #[test]
+    fn highlighted_rows_keep_a_light_fill() {
+        assert_eq!(row_highlight(true, true, true), Some(ACCENT));
+        assert_eq!(row_highlight(false, true, true), Some(ROW_SELECTED));
+        assert_eq!(row_highlight(false, false, true), Some(ROW_HOVER));
+        assert_eq!(row_highlight(false, false, false), None);
     }
 
     #[test]
