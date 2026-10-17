@@ -3,8 +3,9 @@
 mod playlist;
 
 pub use playlist::{
-    load_saved_playlist, Back, Cursor, PlayState, Playlist, PlaylistEntry, Repeat, RowView,
-    SavedPlaylist, SavedRow, Step,
+    load_saved_playlist, playlist_from_descriptions, playlist_matching, reuse_source_id, Back,
+    Cursor, PlayState, Playlist, PlaylistEntry, Repeat, RowView, SavedPlaylist, SavedPosition,
+    SavedRow, Step,
 };
 
 use std::path::PathBuf;

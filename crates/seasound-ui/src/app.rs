@@ -10,8 +10,8 @@ use std::time::Duration;
 use directories::ProjectDirs;
 use eframe::egui;
 use seasound_model::{
-    format_time, load_saved_playlist, Cover, DecodeParams, PlayState, Playlist, Repeat, RowView,
-    SavedPlaylist, SavedRow, Source, SourceId,
+    format_time, playlist_from_descriptions, playlist_matching, Cover, DecodeParams, PlayState,
+    Playlist, Repeat, RowView, SavedPlaylist, SavedPosition, SavedRow, Source, SourceId,
 };
 use seasound_playback::{Command, Engine, Opener, Snapshot, StartAt};
 use serde::{Deserialize, Serialize};
@@ -43,8 +43,12 @@ pub struct SeaSoundApp {
     warnings: HashMap<SourceId, String>,
     textures: HashMap<SourceId, egui::TextureHandle>,
     cover_failed: HashSet<SourceId>,
-    load_rx: Option<Receiver<LoadDone>>,
+    load_rx: Option<Receiver<LoadEvent>>,
     loading: bool,
+    /// Files read so far, and how many the playlist names. `total` is 0 when it is not known yet.
+    load_progress: Option<(usize, usize)>,
+    /// The saved track is already playing while the other files are still being read.
+    priority_started: bool,
     dialog: Option<Dialog>,
     dialog_arm: bool,
     seen_rows: bool,
@@ -81,16 +85,44 @@ enum Dialog {
 
 enum LoadWork {
     Paths { paths: Vec<PathBuf>, import: Import },
-    SavedFile(PathBuf),
+    /// `restore_position` plays the saved place. Startup leaves it off so a fallback
+    /// file still loads without starting playback.
+    SavedFile {
+        path: PathBuf,
+        restore_position: bool,
+    },
     /// The playlist stored in settings, not a playlist file the user opened.
     Session(SessionPlayback),
 }
 
-enum LoadDone {
-    Sources { sources: Vec<Source>, import: Import },
-    Saved { playlist: Playlist, path: PathBuf },
-    Session { playlist: Playlist, session: SessionPlayback },
+enum LoadEvent {
+    /// The file that was playing is ready. The other files are still being read.
+    Priority {
+        playlist: Playlist,
+        path: Option<PathBuf>,
+        position: SavedPosition,
+    },
+    /// One probed file. The first of these onto an empty playlist starts playback.
+    Source { source: Source, import: Import },
+    /// Rows read so far. The track already playing keeps its decoder.
+    Extend {
+        playlist: Playlist,
+        path: Option<PathBuf>,
+    },
+    Progress { done: usize, total: usize },
+    /// Every file has been reported. The playlist is already in the window.
+    Settled,
+    Finished(LoadDone),
     Failed(String),
+}
+
+enum LoadDone {
+    Saved {
+        playlist: Playlist,
+        path: PathBuf,
+        position: Option<SavedPosition>,
+    },
+    Session { playlist: Playlist, session: SessionPlayback },
 }
 
 #[derive(Clone)]
@@ -160,15 +192,7 @@ struct Settings {
 struct SessionPlayback {
     rows: Vec<SavedRow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    track: Option<ResumeTrack>,
-}
-
-/// Identity of the current row. The index is not stored: a missing file shifts the list.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct ResumeTrack {
-    path: PathBuf,
-    start_frame: u64,
-    position_frames: u64,
+    track: Option<SavedPosition>,
 }
 
 fn default_volume() -> f32 {
@@ -245,6 +269,8 @@ impl SeaSoundApp {
             cover_failed: HashSet::new(),
             load_rx: None,
             loading: false,
+            load_progress: None,
+            priority_started: false,
             dialog: None,
             dialog_arm: false,
             seen_rows: false,
@@ -264,63 +290,145 @@ impl SeaSoundApp {
         };
         match startup_load(settings.resume_playback, settings.session, settings.playlist) {
             StartupLoad::Session(session) => {
-                // The saved rows are the playlist that was in the window, not the file
-                // from Open playlist or Save playlist.
-                app.playlist_path = None;
+                // Rows come from the session. The playlist path stays attached so a later
+                // switch or exit still writes this place back to that file.
                 app.spawn(LoadWork::Session(session));
             }
-            StartupLoad::File(path) => app.spawn(LoadWork::SavedFile(path)),
+            StartupLoad::File(path) => app.spawn(LoadWork::SavedFile {
+                path,
+                restore_position: false,
+            }),
             StartupLoad::Empty => {}
         }
         app
     }
 
     fn spawn(&mut self, work: LoadWork) {
+        let replacing = match &work {
+            LoadWork::Paths { import: Import::Replace, .. } | LoadWork::SavedFile { .. } => {
+                self.playlist_path = None;
+                true
+            }
+            LoadWork::Session(_) => true,
+            LoadWork::Paths { import: Import::Append, .. } => false,
+        };
+        if replacing {
+            // The previous list stays out of the way while the new one is read.
+            self.engine.command(Command::Clear);
+            self.covers.clear();
+            self.warnings.clear();
+            self.textures.clear();
+            self.cover_failed.clear();
+            self.forget_selection();
+            self.seek = 0.0;
+            self.seek_drag = false;
+            self.last_followed = None;
+        }
         let (tx, rx) = mpsc::channel();
         self.load_rx = Some(rx);
         self.loading = true;
+        self.load_progress = None;
+        self.priority_started = false;
         self.settle = 30;
-        thread::spawn(move || {
-            let _ = tx.send(work.run());
-        });
+        thread::spawn(move || work.run(tx));
     }
 
     fn poll_load(&mut self) {
-        let done = match self.load_rx.as_ref() {
-            Some(rx) => match rx.try_recv() {
-                Ok(done) => Some(done),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(LoadDone::Failed("reading stopped".into())),
-            },
-            None => None,
-        };
-        let Some(done) = done else {
-            return;
-        };
-        self.load_rx = None;
-        self.loading = false;
-        self.settle = 30;
-        match done {
-            LoadDone::Sources { sources, import } => match import {
-                Import::Replace => self.install_sources(sources, true),
-                Import::Append => self.append_sources(sources),
-            },
-            LoadDone::Saved { playlist, path } => {
-                self.install_playlist(playlist, false, Some(path), None)
-            }
-            LoadDone::Session { playlist, session } => {
-                let start = session
-                    .track
-                    .as_ref()
-                    .and_then(|track| resume_start(&playlist, track));
-                self.install_playlist(playlist, false, None, start);
-            }
-            LoadDone::Failed(message) => self.notice = Some(message),
+        loop {
+            let event = match self.load_rx.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(TryRecvError::Empty) => return,
+                    Err(TryRecvError::Disconnected) => {
+                        self.load_rx = None;
+                        self.loading = false;
+                        self.load_progress = None;
+                        return;
+                    }
+                },
+                None => return,
+            };
+            self.apply_load(event);
         }
     }
 
-    fn install_sources(&mut self, sources: Vec<Source>, autoplay: bool) {
-        self.install_playlist(Playlist::new(sources), autoplay, None, None);
+    fn apply_load(&mut self, event: LoadEvent) {
+        match event {
+            LoadEvent::Progress { done, total } => {
+                self.load_progress = Some((done, total));
+            }
+            LoadEvent::Priority {
+                playlist,
+                path,
+                position,
+            } => {
+                let start = resume_start(&playlist, &position);
+                self.install_playlist(playlist, false, path, start);
+                self.priority_started = true;
+                self.loading = true;
+                self.settle = 30;
+            }
+            LoadEvent::Source { source, import } => {
+                // Open replaces by clearing first, so this append starts playback only
+                // when the window was empty. Later files join without restarting it.
+                match import {
+                    Import::Replace | Import::Append => self.append_sources(vec![source]),
+                }
+            }
+            LoadEvent::Extend { playlist, path } => {
+                if let Some(path) = path {
+                    self.playlist_path = Some(path);
+                }
+                self.complete_playlist(playlist);
+            }
+            LoadEvent::Settled => {
+                self.loading = false;
+                self.load_progress = None;
+                self.priority_started = false;
+                self.settle = 30;
+            }
+            LoadEvent::Failed(message) => {
+                self.loading = false;
+                self.load_progress = None;
+                self.priority_started = false;
+                self.notice = Some(message);
+            }
+            LoadEvent::Finished(done) => {
+                self.loading = false;
+                self.load_progress = None;
+                self.settle = 30;
+                let priority = self.priority_started;
+                self.priority_started = false;
+                match done {
+                    LoadDone::Saved {
+                        playlist,
+                        path,
+                        position,
+                    } => {
+                        if priority {
+                            self.playlist_path = Some(path);
+                            self.complete_playlist(playlist);
+                        } else {
+                            let start = position
+                                .as_ref()
+                                .and_then(|position| resume_start(&playlist, position));
+                            self.install_playlist(playlist, false, Some(path), start);
+                        }
+                    }
+                    LoadDone::Session { playlist, session } => {
+                        if priority {
+                            self.complete_playlist(playlist);
+                        } else {
+                            let start = session
+                                .track
+                                .as_ref()
+                                .and_then(|track| resume_start(&playlist, track));
+                            self.install_playlist(playlist, false, None, start);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn append_sources(&mut self, sources: Vec<Source>) {
@@ -332,9 +440,27 @@ impl SeaSoundApp {
         self.settle = 30;
     }
 
+    fn new_playlist(&mut self) {
+        self.snap = self.engine.snapshot();
+        if !self.snap.rows.is_empty() {
+            // Keep the place in the file that is open, then leave that file alone.
+            self.flush_open_playlist();
+        }
+        self.playlist_path = None;
+        self.empty_window();
+    }
+
     fn clear_playlist(&mut self) {
+        // Drop the window without writing. The open file keeps its last saved place.
+        self.playlist_path = None;
+        self.empty_window();
+    }
+
+    fn empty_window(&mut self) {
         self.load_rx = None;
         self.loading = false;
+        self.load_progress = None;
+        self.priority_started = false;
         self.engine.command(Command::Clear);
         self.covers.clear();
         self.warnings.clear();
@@ -381,6 +507,16 @@ impl SeaSoundApp {
         if let Some(path) = path {
             self.playlist_path = Some(path);
         }
+    }
+
+    /// Add the files that finished reading. The track already playing keeps its decoder.
+    fn complete_playlist(&mut self, mut playlist: Playlist) {
+        let (covers, warnings) = take_art(&mut playlist);
+        self.covers.extend(covers);
+        self.warnings.extend(warnings);
+        self.engine.command(Command::ReplacePlaylist(playlist));
+        self.forget_selection();
+        self.settle = 30;
     }
 
     fn take_drops(&mut self, ctx: &egui::Context) {
@@ -506,18 +642,39 @@ impl SeaSoundApp {
                     }
                     ui.separator();
                     if ui
+                        .button("New playlist")
+                        .on_hover_text(
+                            "Save your place in the open file, then start an empty playlist. The next Save uses a new name.",
+                        )
+                        .clicked()
+                    {
+                        self.new_playlist();
+                        ui.close_menu();
+                    }
+                    if ui
                         .add_enabled(!self.snap.rows.is_empty(), egui::Button::new("Clear playlist"))
+                        .on_hover_text(
+                            "Remove every track. The open file is left unchanged, and the next Save uses a new name.",
+                        )
                         .clicked()
                     {
                         self.clear_playlist();
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Open playlist…").clicked() {
+                    if ui
+                        .button("Open playlist…")
+                        .on_hover_text("Replace the playlist and resume its saved position")
+                        .clicked()
+                    {
                         self.dialog = Some(Dialog::OpenPlaylist);
                         ui.close_menu();
                     }
-                    if ui.button("Save playlist…").clicked() {
+                    if ui
+                        .button("Save playlist…")
+                        .on_hover_text("Save this playlist and the current position")
+                        .clicked()
+                    {
                         self.dialog = Some(Dialog::SavePlaylist);
                         ui.close_menu();
                     }
@@ -662,7 +819,7 @@ impl SeaSoundApp {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "On exit, SeaSound saves the playlist in the app, the current track, and the position. The next launch plays that track from the saved position. This is the playlist in the window, not a playlist file you opened.",
+                        "On exit, SeaSound saves the playlist in the app, the current track, and the position. The next launch plays that track from the saved position. This is the playlist in the window, not a playlist file you opened. Save playlist stores that same place in the file. Open playlist plays the file from there.",
                     )
                     .size(13.0)
                     .color(ui.visuals().weak_text_color()),
@@ -835,7 +992,7 @@ impl SeaSoundApp {
     fn status_line(&self, ui: &mut egui::Ui, snap: &Snapshot, source_id: Option<SourceId>) {
         let mut parts: Vec<String> = Vec::new();
         if self.loading {
-            parts.push("Reading…".into());
+            parts.push(loading_label(self.load_progress));
         }
         if let Some(notice) = &self.notice {
             parts.push(notice.clone());
@@ -894,11 +1051,11 @@ impl SeaSoundApp {
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         let message = if self.loading {
-                            "Reading…"
+                            loading_label(self.load_progress)
                         } else if hovering {
-                            "Drop audio to add it"
+                            "Drop audio to add it".to_string()
                         } else {
-                            "No tracks yet"
+                            "No tracks yet".to_string()
                         };
                         ui.label(egui::RichText::new(message).size(18.0));
                         ui.add_space(8.0);
@@ -911,6 +1068,13 @@ impl SeaSoundApp {
             }
             if hovering {
                 ui.label(egui::RichText::new("Drop audio to add it").color(ACCENT));
+            }
+            if self.loading {
+                ui.label(
+                    egui::RichText::new(loading_label(self.load_progress))
+                        .color(ACCENT)
+                        .size(14.0),
+                );
             }
             column_header(ui);
             ui.separator();
@@ -1289,11 +1453,17 @@ impl SeaSoundApp {
                     .add_filter("All files", &["*"])
                     .pick_files()
                 {
+                    if matches!(import, Import::Replace) {
+                        self.flush_open_playlist();
+                    }
                     self.spawn(LoadWork::Paths { paths, import });
                 }
             }
             Dialog::Folder(import) => {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    if matches!(import, Import::Replace) {
+                        self.flush_open_playlist();
+                    }
                     self.spawn(LoadWork::Paths {
                         paths: vec![path],
                         import,
@@ -1305,7 +1475,11 @@ impl SeaSoundApp {
                     .add_filter("Playlist", &["json"])
                     .pick_file()
                 {
-                    self.spawn(LoadWork::SavedFile(path));
+                    self.flush_open_playlist();
+                    self.spawn(LoadWork::SavedFile {
+                        path,
+                        restore_position: true,
+                    });
                 }
             }
             Dialog::SavePlaylist => {
@@ -1322,6 +1496,9 @@ impl SeaSoundApp {
                 }
                 if let Some(path) = dialog.save_file() {
                     let path = ensure_json(path);
+                    if self.playlist_path.as_ref() != Some(&path) {
+                        self.flush_open_playlist();
+                    }
                     self.playlist_path = Some(path.clone());
                     self.write_playlist_file(&path);
                 }
@@ -1334,7 +1511,7 @@ impl SeaSoundApp {
         if !self.snap.rows.is_empty() {
             self.seen_rows = true;
         }
-        match saved_from_rows(&self.snap.rows).to_json() {
+        match saved_playlist(&self.snap.rows, playback_position(&self.snap)).to_json() {
             Ok(json) => {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -1410,15 +1587,16 @@ impl SeaSoundApp {
             return;
         }
         let rows = saved_from_rows(&self.snap.rows).rows;
-        let track = self.snap.index.and_then(|index| {
-            let row = self.snap.rows.get(index)?;
-            Some(ResumeTrack {
-                path: row.path.clone(),
-                start_frame: row.start_frame,
-                position_frames: self.snap.position_frames,
-            })
-        });
+        let track = playback_position(&self.snap);
         self.session = Some(SessionPlayback { rows, track });
+    }
+
+    /// Write the attached playlist file before leaving it, so its playhead stays put.
+    fn flush_open_playlist(&mut self) {
+        let Some(path) = self.playlist_path.clone() else {
+            return;
+        };
+        self.write_playlist_file(&path);
     }
 }
 
@@ -1473,28 +1651,51 @@ impl SeaSoundApp {
 }
 
 impl LoadWork {
-    fn run(self) -> LoadDone {
+    fn run(self, tx: mpsc::Sender<LoadEvent>) {
         match self {
-            LoadWork::Paths { paths, import } => LoadDone::Sources {
-                sources: seasound_media::load_paths(&paths),
-                import,
-            },
-            LoadWork::SavedFile(path) => match std::fs::read_to_string(&path) {
-                Ok(text) => match playlist_from_text(&text) {
-                    Ok(playlist) => LoadDone::Saved { playlist, path },
-                    Err(message) => LoadDone::Failed(message),
-                },
-                Err(err) => LoadDone::Failed(err.to_string()),
-            },
+            LoadWork::Paths { paths, import } => {
+                let mut done = 0usize;
+                seasound_media::load_paths_each(&paths, |source| {
+                    done += 1;
+                    if tx.send(LoadEvent::Source { source, import }).is_err() {
+                        return false;
+                    }
+                    tx.send(LoadEvent::Progress { done, total: 0 }).is_ok()
+                });
+                let _ = tx.send(LoadEvent::Settled);
+            }
+            LoadWork::SavedFile {
+                path,
+                restore_position,
+            } => {
+                let text = match std::fs::read_to_string(&path) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        let _ = tx.send(LoadEvent::Failed(err.to_string()));
+                        return;
+                    }
+                };
+                let saved = match SavedPlaylist::from_json(&text) {
+                    Ok(saved) => saved,
+                    Err(err) => {
+                        let _ = tx.send(LoadEvent::Failed(err.to_string()));
+                        return;
+                    }
+                };
+                let position = if restore_position {
+                    saved.position.clone()
+                } else {
+                    None
+                };
+                load_saved_rows(&saved, position, Some(path), false, &tx);
+            }
             LoadWork::Session(session) => {
                 let saved = SavedPlaylist {
                     version: 1,
                     rows: session.rows.clone(),
+                    position: session.track.clone(),
                 };
-                LoadDone::Session {
-                    playlist: playlist_from_saved(&saved),
-                    session,
-                }
+                load_saved_rows(&saved, session.track, None, true, &tx);
             }
         }
     }
@@ -1516,20 +1717,134 @@ fn opener() -> Opener {
     })
 }
 
-fn playlist_from_text(text: &str) -> Result<Playlist, String> {
-    let saved = SavedPlaylist::from_json(text).map_err(|err| err.to_string())?;
-    Ok(playlist_from_saved(&saved))
+/// The file to start before the others. One file, or a list with no saved place, waits.
+fn early_file(paths: &[PathBuf], position: Option<&SavedPosition>) -> Option<PathBuf> {
+    if paths.len() < 2 {
+        return None;
+    }
+    let position = position?;
+    paths
+        .iter()
+        .find(|path| *path == &position.path)
+        .cloned()
 }
 
-fn playlist_from_saved(saved: &SavedPlaylist) -> Playlist {
+fn distinct_paths(rows: &[SavedRow]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    for row in &saved.rows {
+    for row in rows {
         if !paths.iter().any(|path| path == &row.path) {
             paths.push(row.path.clone());
         }
     }
-    let probed = seasound_media::load_paths(&paths);
-    load_saved_playlist(saved, probed)
+    paths
+}
+
+/// Install a playlist that already describes every row. Otherwise read the saved
+/// track first, then the files after it, then the files before it, adding each as it finishes.
+fn load_saved_rows(
+    saved: &SavedPlaylist,
+    position: Option<SavedPosition>,
+    file: Option<PathBuf>,
+    session: bool,
+    tx: &mpsc::Sender<LoadEvent>,
+) {
+    if let Some(playlist) = playlist_from_descriptions(&saved.rows) {
+        let finished = if session {
+            LoadDone::Session {
+                playlist,
+                session: SessionPlayback {
+                    rows: saved.rows.clone(),
+                    track: position,
+                },
+            }
+        } else {
+            let Some(path) = file else {
+                return;
+            };
+            LoadDone::Saved {
+                playlist,
+                path,
+                position,
+            }
+        };
+        let _ = tx.send(LoadEvent::Finished(finished));
+        return;
+    }
+    let paths = distinct_paths(&saved.rows);
+    let total = paths.len();
+    let early = early_file(&paths, position.as_ref());
+    let order = probe_order(&paths, early.as_deref());
+    let mut probed: Vec<Source> = Vec::new();
+    let mut started = false;
+    for (index, path) in order.iter().enumerate() {
+        let mut loaded = seasound_media::load_paths(std::slice::from_ref(path));
+        for source in &mut loaded {
+            source.id = SourceId::fresh();
+        }
+        probed.extend(loaded);
+        let playlist = playlist_matching(saved, probed.clone());
+        for source in &mut probed {
+            source.cover = None;
+        }
+        let playable = playlist
+            .sources
+            .iter()
+            .any(|source| source.path == *path && source.playable());
+        let matches_place = position.as_ref().is_some_and(|place| place.path == *path);
+        if !started && matches_place && playable {
+            let Some(position) = position.clone() else {
+                return;
+            };
+            if tx
+                .send(LoadEvent::Priority {
+                    playlist,
+                    path: file.clone(),
+                    position,
+                })
+                .is_err()
+            {
+                return;
+            }
+            started = true;
+        } else if tx
+            .send(LoadEvent::Extend {
+                playlist,
+                path: if session { None } else { file.clone() },
+            })
+            .is_err()
+        {
+            return;
+        }
+        let done = index + 1;
+        if total > 1 && tx.send(LoadEvent::Progress { done, total }).is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(LoadEvent::Settled);
+}
+
+/// Resume file, then everything after it, then everything before it.
+/// The row that plays next is therefore read before the rows already passed.
+fn probe_order(paths: &[PathBuf], early: Option<&Path>) -> Vec<PathBuf> {
+    let Some(early) = early else {
+        return paths.to_vec();
+    };
+    let Some(index) = paths.iter().position(|path| path == early) else {
+        return paths.to_vec();
+    };
+    let mut order = Vec::with_capacity(paths.len());
+    order.push(paths[index].clone());
+    order.extend(paths[index + 1..].iter().cloned());
+    order.extend(paths[..index].iter().cloned());
+    order
+}
+
+fn loading_label(progress: Option<(usize, usize)>) -> String {
+    match progress {
+        Some((done, total)) if total > 1 => format!("Loading… {done} / {total}"),
+        Some((done, 0)) if done > 0 => format!("Loading… {done}"),
+        _ => "Loading…".to_string(),
+    }
 }
 
 /// Resume uses the playlist saved in settings. A playlist file path is only a fallback
@@ -1555,7 +1870,7 @@ fn startup_load(
     StartupLoad::Empty
 }
 
-fn resume_start(playlist: &Playlist, track: &ResumeTrack) -> Option<StartAt> {
+fn resume_start(playlist: &Playlist, track: &SavedPosition) -> Option<StartAt> {
     let rows = playlist.rows();
     let position = rows
         .iter()
@@ -1585,6 +1900,10 @@ fn take_art(playlist: &mut Playlist) -> (HashMap<SourceId, Cover>, HashMap<Sourc
 }
 
 fn saved_from_rows(rows: &[RowView]) -> SavedPlaylist {
+    saved_playlist(rows, None)
+}
+
+fn saved_playlist(rows: &[RowView], position: Option<SavedPosition>) -> SavedPlaylist {
     SavedPlaylist {
         version: 1,
         rows: rows
@@ -1593,9 +1912,33 @@ fn saved_from_rows(rows: &[RowView]) -> SavedPlaylist {
                 path: row.path.clone(),
                 start_frame: row.start_frame,
                 title: row.title.clone(),
+                artist: row.artist.clone(),
+                album: row.album.clone(),
+                end_frame: row.start_frame.saturating_add(row.frames),
+                sample_rate: row.sample_rate,
+                channels: row.channels,
+                bitrate_bps: row.bitrate_bps,
+                bits_per_sample: row.bits_per_sample,
+                delay: row.delay,
+                padding: row.padding,
+                presentation_frames: row.presentation_frames,
+                number: row.number,
+                format_name: row.format_name.clone(),
+                group: row.group.clone(),
             })
             .collect(),
+        position,
     }
+}
+
+fn playback_position(snap: &Snapshot) -> Option<SavedPosition> {
+    let index = snap.index?;
+    let row = snap.rows.get(index)?;
+    Some(SavedPosition {
+        path: row.path.clone(),
+        start_frame: row.start_frame,
+        position_frames: snap.position_frames,
+    })
 }
 
 fn hit_track(
@@ -2152,6 +2495,9 @@ mod tests {
             channels: 2,
             bitrate_bps: 900_000,
             bits_per_sample: 16,
+            delay: 0,
+            padding: 0,
+            presentation_frames: start + 1000,
             group: group.map(str::to_string),
             error: None,
             path: PathBuf::from("/music/album.flac"),
@@ -2228,6 +2574,245 @@ mod tests {
         assert_eq!(saved.rows[0].start_frame, 88200);
         assert_eq!(saved.rows[0].title, "On the Run");
         assert_eq!(saved.rows[0].path, PathBuf::from("/music/album.flac"));
+        assert!(saved.position.is_none());
+        assert!(saved.rows[0].described());
+        assert_eq!(saved.rows[0].artist, "Artist");
+        assert_eq!(saved.rows[0].end_frame, 89200);
+    }
+
+    #[test]
+    fn saved_playlist_keeps_the_play_position() {
+        let rows = vec![row(3, None, 88200, "On the Run")];
+        let position = SavedPosition {
+            path: PathBuf::from("/music/album.flac"),
+            start_frame: 88200,
+            position_frames: 1000,
+        };
+        let saved = saved_playlist(&rows, Some(position.clone()));
+        let json = saved.to_json().expect("json");
+        let back = SavedPlaylist::from_json(&json).expect("parse");
+        assert_eq!(back.position, Some(position));
+        let snap = Snapshot {
+            index: Some(0),
+            position_frames: 1000,
+            rows: std::sync::Arc::new(rows),
+            ..Snapshot::default()
+        };
+        assert_eq!(playback_position(&snap), back.position);
+        assert!(playback_position(&Snapshot::default()).is_none());
+    }
+
+    #[test]
+    fn open_playlist_restores_the_position_and_startup_does_not() {
+        let dir = std::env::temp_dir().join(format!(
+            "seasound-playlist-place-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audio = dir.join("chapter.flac");
+        let file = dir.join("book.json");
+        let saved = SavedPlaylist {
+            version: 1,
+            rows: vec![SavedRow {
+                path: audio.clone(),
+                start_frame: 0,
+                end_frame: 1000,
+                title: "Chapter".into(),
+                sample_rate: 44100,
+                channels: 2,
+                presentation_frames: 1000,
+                number: 1,
+                format_name: "FLAC".into(),
+                ..SavedRow::default()
+            }],
+            position: Some(SavedPosition {
+                path: audio.clone(),
+                start_frame: 0,
+                position_frames: 50,
+            }),
+        };
+        std::fs::write(&file, saved.to_json().unwrap()).unwrap();
+        match finished_load(LoadWork::SavedFile {
+            path: file.clone(),
+            restore_position: true,
+        }) {
+            LoadDone::Saved {
+                playlist,
+                position: Some(position),
+                ..
+            } => {
+                let start = resume_start(&playlist, &position).expect("place");
+                assert_eq!(start.index, 0);
+                assert!(playlist.sources[0].playable());
+                assert!(playlist.sources[0].error.is_none());
+                assert!(!audio.exists());
+            }
+            LoadDone::Saved { position: None, .. } => panic!("open dropped the position"),
+            LoadDone::Session { .. } => panic!("wrong load"),
+        }
+        match finished_load(LoadWork::SavedFile {
+            path: file,
+            restore_position: false,
+        }) {
+            LoadDone::Saved { position: None, .. } => {}
+            LoadDone::Saved { position: Some(_), .. } => panic!("startup used the position"),
+            LoadDone::Session { .. } => panic!("wrong load"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_playlist_adds_each_file_before_the_load_finishes() {
+        let dir = std::env::temp_dir().join(format!(
+            "seasound-playlist-grow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = PathBuf::from("/no/such/seasound-001.mp3");
+        let second = PathBuf::from("/no/such/seasound-002.mp3");
+        let saved = SavedPlaylist {
+            version: 1,
+            rows: vec![
+                SavedRow {
+                    path: first.clone(),
+                    start_frame: 0,
+                    title: "One".into(),
+                    ..SavedRow::default()
+                },
+                SavedRow {
+                    path: second.clone(),
+                    start_frame: 0,
+                    title: "Two".into(),
+                    ..SavedRow::default()
+                },
+            ],
+            position: Some(SavedPosition {
+                path: second.clone(),
+                start_frame: 0,
+                position_frames: 10,
+            }),
+        };
+        let file = dir.join("book.json");
+        std::fs::write(&file, saved.to_json().unwrap()).unwrap();
+        let events = load_events(LoadWork::SavedFile {
+            path: file,
+            restore_position: true,
+        });
+        let playlists: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                LoadEvent::Extend { playlist, .. } => Some(playlist.sources.len()),
+                LoadEvent::Priority { playlist, .. } => Some(playlist.sources.len()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            playlists.len() >= 2,
+            "rows should appear as each file is read, got {playlists:?}"
+        );
+        assert_eq!(playlists[0], 1);
+        assert_eq!(*playlists.last().unwrap(), 2);
+        assert!(matches!(events.last(), Some(LoadEvent::Settled)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropped_files_are_reported_one_at_a_time() {
+        let first = PathBuf::from("/no/such/seasound-drop-a.mp3");
+        let second = PathBuf::from("/no/such/seasound-drop-b.mp3");
+        let events = load_events(LoadWork::Paths {
+            paths: vec![first.clone(), second.clone()],
+            import: Import::Append,
+        });
+        let paths: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                LoadEvent::Source { source, .. } => Some(source.path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec![first, second]);
+        assert!(matches!(events.last(), Some(LoadEvent::Settled)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LoadEvent::Progress { done: 1, total: 0 }
+        )));
+    }
+
+    #[test]
+    fn a_saved_place_is_the_file_read_before_the_rest() {
+        let first = PathBuf::from("/music/book/001.mp3");
+        let second = PathBuf::from("/music/book/002.mp3");
+        let paths = vec![first.clone(), second];
+        assert!(early_file(&paths, None).is_none());
+        assert!(early_file(
+            &paths[..1],
+            Some(&SavedPosition {
+                path: first.clone(),
+                start_frame: 0,
+                position_frames: 10,
+            })
+        )
+        .is_none());
+        assert_eq!(
+            early_file(
+                &paths,
+                Some(&SavedPosition {
+                    path: first.clone(),
+                    start_frame: 4,
+                    position_frames: 10,
+                })
+            ),
+            Some(first)
+        );
+        assert_eq!(loading_label(None), "Loading…");
+        assert_eq!(loading_label(Some((1, 1))), "Loading…");
+        assert_eq!(loading_label(Some((2, 40))), "Loading… 2 / 40");
+        assert_eq!(loading_label(Some((3, 0))), "Loading… 3");
+        let paths = vec![
+            PathBuf::from("/music/book/001.mp3"),
+            PathBuf::from("/music/book/002.mp3"),
+            PathBuf::from("/music/book/003.mp3"),
+        ];
+        let early = paths[1].clone();
+        assert_eq!(
+            probe_order(&paths, Some(&early)),
+            vec![paths[1].clone(), paths[2].clone(), paths[0].clone()]
+        );
+    }
+
+    fn finished_load(work: LoadWork) -> LoadDone {
+        let mut finished = None;
+        for event in load_events(work) {
+            match event {
+                LoadEvent::Finished(done) => finished = Some(done),
+                LoadEvent::Failed(message) => panic!("load failed: {message}"),
+                LoadEvent::Priority { .. }
+                | LoadEvent::Progress { .. }
+                | LoadEvent::Source { .. }
+                | LoadEvent::Extend { .. }
+                | LoadEvent::Settled => {}
+            }
+        }
+        finished.expect("the load did not finish")
+    }
+
+    fn load_events(work: LoadWork) -> Vec<LoadEvent> {
+        let (tx, rx) = mpsc::channel();
+        work.run(tx);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
     }
 
     fn span(index: usize, position: usize, top: f32) -> TrackSpan {
@@ -2341,7 +2926,7 @@ mod tests {
         let playlist = Playlist::new(vec![chaptered("/music/album.flac")]);
         let start = resume_start(
             &playlist,
-            &ResumeTrack {
+            &SavedPosition {
                 path: "/music/album.flac".into(),
                 start_frame: 1000,
                 position_frames: 250,
@@ -2352,7 +2937,7 @@ mod tests {
         assert!((start.fraction - 0.25).abs() < 0.000_1);
         assert!(resume_start(
             &playlist,
-            &ResumeTrack {
+            &SavedPosition {
                 path: "/music/other.flac".into(),
                 start_frame: 0,
                 position_frames: 10,
@@ -2361,7 +2946,7 @@ mod tests {
         .is_none());
         let clamped = resume_start(
             &playlist,
-            &ResumeTrack {
+            &SavedPosition {
                 path: "/music/album.flac".into(),
                 start_frame: 0,
                 position_frames: 50_000,
@@ -2390,8 +2975,9 @@ mod tests {
                 path: PathBuf::from("/music/in-app.flac"),
                 start_frame: 0,
                 title: "In app".into(),
+                ..SavedRow::default()
             }],
-            track: Some(ResumeTrack {
+            track: Some(SavedPosition {
                 path: PathBuf::from("/music/in-app.flac"),
                 start_frame: 0,
                 position_frames: 10,
@@ -2433,8 +3019,9 @@ mod tests {
                 path: PathBuf::from("/music/in-app.flac"),
                 start_frame: 5,
                 title: "A".into(),
+                ..SavedRow::default()
             }],
-            track: Some(ResumeTrack {
+            track: Some(SavedPosition {
                 path: PathBuf::from("/music/in-app.flac"),
                 start_frame: 5,
                 position_frames: 12,

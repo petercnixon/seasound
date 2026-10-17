@@ -1,6 +1,6 @@
 //! Playlist order, the transport cursor, and the on-disk playlist file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -108,6 +108,9 @@ impl Playlist {
                 channels: source.channels,
                 bitrate_bps: source.bitrate_bps,
                 bits_per_sample: source.bits_per_sample,
+                delay: source.delay,
+                padding: source.padding,
+                presentation_frames: source.presentation_frames,
                 group,
                 error: source.error.clone(),
                 path: source.path.clone(),
@@ -159,9 +162,10 @@ impl Playlist {
         });
     }
 
-    /// Remember rows by path and start frame so a later probe can find them again.
+    /// Remember each row, including the timing a later open can trust without reading the file.
     pub fn to_saved(&self) -> SavedPlaylist {
         let mut rows = Vec::new();
+        let mut previous: Option<SourceId> = None;
         for entry in &self.entries {
             let Some(source) = self.source(entry.source_id) else {
                 continue;
@@ -169,13 +173,44 @@ impl Playlist {
             let Some(segment) = source.segments.get(entry.segment) else {
                 continue;
             };
-            rows.push(SavedRow {
-                path: source.path.clone(),
-                start_frame: segment.start_frame,
-                title: segment.title.clone(),
-            });
+            let group = if source.group_title.is_some() && previous != Some(source.id) {
+                source.group_title.clone()
+            } else {
+                None
+            };
+            previous = Some(source.id);
+            rows.push(saved_row_from(source, segment, group));
         }
-        SavedPlaylist { version: 1, rows }
+        SavedPlaylist {
+            version: 1,
+            rows,
+            position: None,
+        }
+    }
+}
+
+fn saved_row_from(
+    source: &crate::Source,
+    segment: &crate::Segment,
+    group: Option<String>,
+) -> SavedRow {
+    SavedRow {
+        path: source.path.clone(),
+        start_frame: segment.start_frame,
+        title: segment.title.clone(),
+        artist: segment.artist.clone(),
+        album: segment.album.clone(),
+        end_frame: segment.end_frame,
+        sample_rate: source.sample_rate,
+        channels: source.channels,
+        bitrate_bps: source.bitrate_bps,
+        bits_per_sample: source.bits_per_sample,
+        delay: source.delay,
+        padding: source.padding,
+        presentation_frames: source.presentation_frames,
+        number: segment.number,
+        format_name: source.format_name().to_string(),
+        group,
     }
 }
 
@@ -258,15 +293,24 @@ pub struct RowView {
     pub bitrate_bps: u32,
     /// Bits per coded sample. Zero when the file does not say.
     pub bits_per_sample: u16,
+    /// Encoder delay, in PCM frames. Needed so a saved row can open without reading tags.
+    pub delay: u64,
+    /// Encoder padding, in PCM frames.
+    pub padding: u64,
+    /// Audible length of the file after trim.
+    pub presentation_frames: u64,
     pub group: Option<String>,
     pub error: Option<String>,
     pub path: PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedPlaylist {
     pub version: u32,
     pub rows: Vec<SavedRow>,
+    /// Current row and how far into it playback had reached. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<SavedPosition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -274,6 +318,88 @@ pub struct SavedRow {
     pub path: PathBuf,
     pub start_frame: u64,
     pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub artist: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub album: String,
+    /// Exclusive end on the presentation clock. With `sample_rate`, this is the row length.
+    #[serde(default, skip_serializing_if = "zero_u64")]
+    pub end_frame: u64,
+    #[serde(default, skip_serializing_if = "zero_u32")]
+    pub sample_rate: u32,
+    #[serde(default, skip_serializing_if = "zero_u16")]
+    pub channels: u16,
+    #[serde(default, skip_serializing_if = "zero_u32")]
+    pub bitrate_bps: u32,
+    #[serde(default, skip_serializing_if = "zero_u16")]
+    pub bits_per_sample: u16,
+    #[serde(default, skip_serializing_if = "zero_u64")]
+    pub delay: u64,
+    #[serde(default, skip_serializing_if = "zero_u64")]
+    pub padding: u64,
+    #[serde(default, skip_serializing_if = "zero_u64")]
+    pub presentation_frames: u64,
+    #[serde(default, skip_serializing_if = "zero_u32")]
+    pub number: u32,
+    /// `AudioFormat::label`, or a plugin name such as WavPack.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub format_name: String,
+    /// Set on the first saved row of a cue or chapter file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+fn zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn zero_u16(value: &u16) -> bool {
+    *value == 0
+}
+
+impl Default for SavedRow {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::new(),
+            start_frame: 0,
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            end_frame: 0,
+            sample_rate: 0,
+            channels: 0,
+            bitrate_bps: 0,
+            bits_per_sample: 0,
+            delay: 0,
+            padding: 0,
+            presentation_frames: 0,
+            number: 0,
+            format_name: String::new(),
+            group: None,
+        }
+    }
+}
+
+impl SavedRow {
+    /// Enough was stored to build a row without opening the media file.
+    pub fn described(&self) -> bool {
+        self.sample_rate > 0 && self.end_frame > self.start_frame
+    }
+}
+
+/// Identity of one row, plus the playhead inside that row.
+///
+/// The row index is not stored. A missing file shifts the list, and the same path can
+/// hold several cue or chapter rows. `start_frame` tells those apart.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedPosition {
+    pub path: PathBuf,
+    pub start_frame: u64,
+    pub position_frames: u64,
 }
 
 impl SavedPlaylist {
@@ -288,26 +414,31 @@ impl SavedPlaylist {
 
 /// Rebuild a playlist from a saved file.
 ///
-/// `probed` must contain one source per distinct path, in any order, with fresh ids.
-/// Each saved row picks the segment whose start frame matches. A file that no longer
-/// has that range falls back to its first segment.
+/// `probed` must contain one source per distinct path, in any order. Each source id is
+/// replaced. Each saved row picks the segment whose start frame matches. A file that no
+/// longer has that range falls back to its first segment.
 pub fn load_saved_playlist(saved: &SavedPlaylist, mut probed: Vec<Source>) -> Playlist {
     for source in &mut probed {
         source.id = SourceId::fresh();
     }
+    playlist_matching(saved, probed)
+}
+
+/// Same matching as [`load_saved_playlist`], leaving each source id as it already is.
+pub fn playlist_matching(saved: &SavedPlaylist, probed: Vec<Source>) -> Playlist {
     let mut entries = Vec::new();
     for row in &saved.rows {
         let Some(source) = probed.iter().find(|source| source.path == row.path) else {
             continue;
         };
+        if source.segments.is_empty() {
+            continue;
+        }
         let segment = source
             .segments
             .iter()
             .position(|segment| segment.start_frame == row.start_frame)
             .unwrap_or(0);
-        if source.segments.is_empty() {
-            continue;
-        }
         entries.push(PlaylistEntry {
             source_id: source.id,
             segment,
@@ -317,6 +448,112 @@ pub fn load_saved_playlist(saved: &SavedPlaylist, mut probed: Vec<Source>) -> Pl
         sources: probed,
         entries,
     }
+}
+
+/// Build a playlist from saved rows that already name their length and sample rate.
+///
+/// Returns `None` when any row would still need the file read. An empty list is an empty
+/// playlist. Rows that share a path become one source, in the order those rows appear.
+/// The media file is not opened here.
+pub fn playlist_from_descriptions(rows: &[SavedRow]) -> Option<Playlist> {
+    if rows.iter().any(|row| !row.described()) {
+        return None;
+    }
+    let mut sources: Vec<Source> = Vec::new();
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let source_index = match sources.iter().position(|source| source.path == row.path) {
+            Some(index) => index,
+            None => {
+                sources.push(source_from_description(row));
+                sources.len() - 1
+            }
+        };
+        let segment_index = sources[source_index].segments.len();
+        let number = if row.number == 0 {
+            (segment_index as u32).saturating_add(1)
+        } else {
+            row.number
+        };
+        sources[source_index].segments.push(crate::Segment {
+            number,
+            title: row.title.clone(),
+            artist: row.artist.clone(),
+            album: row.album.clone(),
+            start_frame: row.start_frame,
+            end_frame: row.end_frame,
+        });
+        let heard = row.presentation_frames.max(row.end_frame);
+        if sources[source_index].presentation_frames < heard {
+            sources[source_index].presentation_frames = heard;
+        }
+        let id = sources[source_index].id;
+        entries.push(PlaylistEntry {
+            source_id: id,
+            segment: segment_index,
+        });
+    }
+    Some(Playlist { sources, entries })
+}
+
+fn source_from_description(row: &SavedRow) -> Source {
+    let (format, format_label) = format_from_name(&row.format_name);
+    Source {
+        id: SourceId::fresh(),
+        path: row.path.clone(),
+        format,
+        sample_rate: row.sample_rate,
+        channels: row.channels,
+        bitrate_bps: row.bitrate_bps,
+        bits_per_sample: row.bits_per_sample,
+        delay: row.delay,
+        padding: row.padding,
+        presentation_frames: row.presentation_frames.max(row.end_frame),
+        artist: row.artist.clone(),
+        album: row.album.clone(),
+        title: row.title.clone(),
+        disc: 0,
+        track_number: row.number,
+        segments: Vec::new(),
+        group_title: row.group.clone(),
+        error: None,
+        warning: None,
+        format_label,
+        cover: None,
+    }
+}
+
+fn format_from_name(name: &str) -> (crate::AudioFormat, String) {
+    use crate::AudioFormat::{Aac, Aiff, Alac, Flac, Mp3, Other, Vorbis, Wav};
+    match name {
+        "MP3" => (Mp3, String::new()),
+        "AAC" => (Aac, String::new()),
+        "FLAC" => (Flac, String::new()),
+        "ALAC" => (Alac, String::new()),
+        "WAV" => (Wav, String::new()),
+        "AIFF" => (Aiff, String::new()),
+        "Vorbis" => (Vorbis, String::new()),
+        "Audio" | "" => (Other, String::new()),
+        other => (Other, other.to_string()),
+    }
+}
+
+/// Keep `id` on the source at `path`. Playback can then add the other files without
+/// reopening the file that is already playing.
+pub fn reuse_source_id(playlist: &mut Playlist, path: &Path, id: SourceId) -> bool {
+    let Some(source) = playlist.sources.iter_mut().find(|source| source.path == path) else {
+        return false;
+    };
+    let previous = source.id;
+    source.id = id;
+    if previous != id {
+        for entry in &mut playlist.entries {
+            if entry.source_id == previous {
+                entry.source_id = id;
+            }
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -667,16 +904,19 @@ mod tests {
     fn saved_playlist_matches_start_frames() {
         let saved = SavedPlaylist {
             version: 1,
+            position: None,
             rows: vec![
                 SavedRow {
                     path: "album.flac".into(),
                     start_frame: 1000,
                     title: "Breathe".into(),
+                    ..SavedRow::default()
                 },
                 SavedRow {
                     path: "album.flac".into(),
                     start_frame: 0,
                     title: "Speak to Me".into(),
+                    ..SavedRow::default()
                 },
             ],
         };
@@ -720,13 +960,143 @@ mod tests {
             format_label: String::new(),
             cover: None,
         };
-        let playlist = load_saved_playlist(&saved, vec![source]);
+        let playlist = load_saved_playlist(&saved, vec![source.clone()]);
         assert_eq!(playlist.entries.len(), 2);
         assert_eq!(playlist.entries[0].segment, 1);
         assert_eq!(playlist.entries[1].segment, 0);
+        let mut with_place = saved.clone();
+        with_place.position = Some(SavedPosition {
+            path: "album.flac".into(),
+            start_frame: 1000,
+            position_frames: 250,
+        });
+        let json = with_place.to_json().expect("json");
+        let back = SavedPlaylist::from_json(&json).expect("parse");
+        assert_eq!(back.position, with_place.position);
+        let again = load_saved_playlist(&back, vec![source.clone()]);
+        assert_eq!(again.entries[0].segment, 1);
+        let old = SavedPlaylist::from_json(r#"{"version":1,"rows":[]}"#).expect("old file");
+        assert!(old.position.is_none());
+        let mut renamed = load_saved_playlist(&saved, vec![source]);
+        assert!(reuse_source_id(
+            &mut renamed,
+            std::path::Path::new("album.flac"),
+            SourceId(1_000_000)
+        ));
+        assert_eq!(renamed.sources[0].id, SourceId(1_000_000));
+        assert!(renamed
+            .entries
+            .iter()
+            .all(|entry| entry.source_id == SourceId(1_000_000)));
+        assert!(!reuse_source_id(
+            &mut renamed,
+            std::path::Path::new("missing.flac"),
+            SourceId(1)
+        ));
+        assert!(!SavedPlaylist {
+            version: 1,
+            rows: Vec::new(),
+            position: None,
+        }
+        .to_json()
+        .expect("json")
+        .contains("position"));
         let rows = playlist.rows();
         assert_eq!(rows[0].group.as_deref(), Some("album"));
         assert!(rows[1].group.is_none());
+        let bare = SavedRow {
+            path: "a.flac".into(),
+            start_frame: 0,
+            title: "A".into(),
+            ..SavedRow::default()
+        };
+        assert!(!bare.described());
+        assert!(!serde_json::to_string(&bare).expect("json").contains("sample_rate"));
+        assert!(playlist_from_descriptions(&saved.rows).is_none());
+        assert!(playlist_from_descriptions(&[])
+            .expect("empty")
+            .entries
+            .is_empty());
+    }
+
+    #[test]
+    fn described_rows_rebuild_without_opening_the_file() {
+        let mut source = bare("album.flac");
+        source.id = SourceId(1_000_000);
+        source.delay = 576;
+        source.padding = 1560;
+        source.presentation_frames = 2500;
+        source.group_title = Some("Album".into());
+        source.format_label = String::new();
+        source.segments = vec![
+            crate::Segment {
+                number: 1,
+                title: "Speak to Me".into(),
+                artist: "Pink Floyd".into(),
+                album: "Dark Side".into(),
+                start_frame: 0,
+                end_frame: 1000,
+            },
+            crate::Segment {
+                number: 2,
+                title: "Breathe".into(),
+                artist: "Pink Floyd".into(),
+                album: "Dark Side".into(),
+                start_frame: 1000,
+                end_frame: 2500,
+            },
+        ];
+        let mut other = bare("next.mp3");
+        other.id = SourceId(1_000_001);
+        other.format = crate::AudioFormat::Mp3;
+        other.format_label = String::new();
+        let mut playlist = Playlist::empty();
+        playlist.sources = vec![source, other];
+        playlist.entries = vec![
+            PlaylistEntry {
+                source_id: playlist.sources[0].id,
+                segment: 0,
+            },
+            PlaylistEntry {
+                source_id: playlist.sources[0].id,
+                segment: 1,
+            },
+            PlaylistEntry {
+                source_id: playlist.sources[1].id,
+                segment: 0,
+            },
+        ];
+        let saved = playlist.to_saved();
+        assert!(saved.rows.iter().all(|row| row.described()));
+        assert!(saved.rows[0].group.is_some());
+        assert!(saved.rows[1].group.is_none());
+        let json = saved.to_json().expect("json");
+        let back = SavedPlaylist::from_json(&json).expect("parse");
+        let again = playlist_from_descriptions(&back.rows).expect("described");
+        assert_eq!(again.sources.len(), 2);
+        assert_eq!(again.entries.len(), 3);
+        assert_eq!(again.sources[0].segments.len(), 2);
+        assert_eq!(again.sources[0].segments[1].title, "Breathe");
+        assert_eq!(again.sources[0].delay, 576);
+        assert_eq!(again.sources[0].padding, 1560);
+        assert_eq!(again.sources[0].presentation_frames, 2500);
+        assert_eq!(again.sources[0].format, crate::AudioFormat::Flac);
+        assert_eq!(again.sources[0].group_title.as_deref(), Some("Album"));
+        assert_eq!(again.sources[1].path, PathBuf::from("next.mp3"));
+        assert_eq!(again.sources[1].format, crate::AudioFormat::Mp3);
+        assert_ne!(again.sources[0].id, again.sources[1].id);
+        assert!(again.sources.iter().all(|source| source.error.is_none()));
+        assert_eq!(again.entries[0].source_id, again.sources[0].id);
+        assert_eq!(again.entries[0].segment, 0);
+        assert_eq!(again.entries[1].segment, 1);
+        assert_eq!(again.entries[2].source_id, again.sources[1].id);
+        let mut plugin = back.rows[2].clone();
+        plugin.format_name = "WavPack".into();
+        let mut rows = back.rows.clone();
+        rows[2] = plugin;
+        let packed = playlist_from_descriptions(&rows).expect("plugin label");
+        assert_eq!(packed.sources[1].format_label, "WavPack");
+        assert_eq!(packed.sources[1].format_name(), "WavPack");
     }
 
     #[test]

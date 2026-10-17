@@ -59,6 +59,115 @@ pub fn load_paths(paths: &[PathBuf]) -> Vec<Source> {
     sources
 }
 
+/// Probe one file at a time and hand each source to `emit`.
+///
+/// `false` from `emit` stops the walk. A folder is listed first, then each file is
+/// probed in path order. That skips the album sort [`load_paths`] applies, so the
+/// first file can play before the rest of a network folder has been read. Cue sheets
+/// inside a folder are still expanded before the audio they name, and each audio file
+/// in the sheet is emitted as soon as that file has been probed.
+pub fn load_paths_each(paths: &[PathBuf], mut emit: impl FnMut(Source) -> bool) {
+    for path in paths {
+        if !emit_path(path, &mut emit) {
+            return;
+        }
+    }
+}
+
+fn emit_path(path: &Path, emit: &mut dyn FnMut(Source) -> bool) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return emit(error_source(path, "could not read the path"));
+    };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    if meta.is_dir() {
+        return emit_dir(path, emit);
+    }
+    if extension(path) == "cue" {
+        return emit_cue_file(path, emit);
+    }
+    if is_m3u(path) {
+        return emit_m3u(path, emit);
+    }
+    emit(probe_file(path))
+}
+
+fn emit_dir(dir: &Path, emit: &mut dyn FnMut(Source) -> bool) -> bool {
+    let mut files = Vec::new();
+    collect(dir, &mut files, 0);
+    files.sort();
+    let mut cues = Vec::new();
+    let mut audio = Vec::new();
+    for path in files {
+        match extension(&path).as_str() {
+            "cue" => cues.push(path),
+            "m3u" | "m3u8" => {}
+            ext if AUDIO_EXT.contains(&ext) || plugins::claims(ext) => audio.push(path),
+            _ => {}
+        }
+    }
+    let mut consumed = HashSet::new();
+    for cue in &cues {
+        let mut referenced = Vec::new();
+        match emit_cue(cue, &mut referenced, emit) {
+            Ok(keep) => {
+                for path in referenced {
+                    consumed.insert(normalize(&path));
+                }
+                if !keep {
+                    return false;
+                }
+            }
+            Err(err) => {
+                if !emit(error_source(cue, err.message())) {
+                    return false;
+                }
+            }
+        }
+    }
+    for path in audio {
+        if consumed.contains(&normalize(&path)) {
+            continue;
+        }
+        if !emit(probe_file(&path)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn emit_m3u(path: &Path, emit: &mut dyn FnMut(Source) -> bool) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return emit(error_source(path, "could not read the playlist"));
+    };
+    let text = decode_cue_bytes(&bytes);
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let mut any = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        any = true;
+        if !emit(probe_file(&parent.join(line))) {
+            return false;
+        }
+    }
+    if !any {
+        return emit(error_source(path, "the playlist is empty"));
+    }
+    true
+}
+
+fn emit_cue_file(path: &Path, emit: &mut dyn FnMut(Source) -> bool) -> bool {
+    let mut referenced = Vec::new();
+    match emit_cue(path, &mut referenced, emit) {
+        Ok(keep) => keep,
+        Err(err) => emit(error_source(path, err.message())),
+    }
+}
+
 pub fn probe_file(path: &Path) -> Source {
     if extension(path) == "cue" {
         return probe_cue_file(path)
@@ -201,23 +310,11 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
 }
 
 fn load_m3u(path: &Path) -> Vec<Source> {
-    let Ok(bytes) = fs::read(path) else {
-        return vec![error_source(path, "could not read the playlist")];
-    };
-    let text = decode_cue_bytes(&bytes);
-    let parent = path.parent().unwrap_or(Path::new(""));
     let mut sources = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let file = parent.join(line);
-        sources.push(probe_file(&file));
-    }
-    if sources.is_empty() {
-        sources.push(error_source(path, "the playlist is empty"));
-    }
+    emit_m3u(path, &mut |source| {
+        sources.push(source);
+        true
+    });
     sources
 }
 
@@ -228,44 +325,74 @@ fn probe_cue_file(path: &Path) -> Vec<Source> {
 }
 
 fn expand_cue(path: &Path) -> Result<(Vec<Source>, Vec<PathBuf>), Error> {
+    let mut sources = Vec::new();
+    let mut referenced = Vec::new();
+    emit_cue(path, &mut referenced, &mut |source| {
+        sources.push(source);
+        true
+    })?;
+    Ok((sources, referenced))
+}
+
+/// Emit one source per FILE block as that file is probed. `false` means the caller stopped.
+fn emit_cue(
+    path: &Path,
+    referenced: &mut Vec<PathBuf>,
+    emit: &mut dyn FnMut(Source) -> bool,
+) -> Result<bool, Error> {
     let bytes = fs::read(path)?;
     let text = decode_cue_bytes(&bytes);
     let album = cue_album_title(&text);
     // File names do not depend on the sample rate. 44100 only lists the FILE blocks.
     let listing = parse_cue_text(&text, 44100).map_err(Error::new)?;
-    let mut sources = Vec::new();
-    let mut referenced = Vec::new();
+    let mut emitted = false;
     for file in &listing {
-        let audio = resolve_cue_file(path, &file.file_name).ok_or_else(|| {
-            Error::new(format!("cue sheet file \"{}\" was not found", file.file_name))
-        })?;
-        referenced.push(audio.clone());
-        let mut source = probe_audio(&audio, CueMode::Discover)?;
-        let parsed = parse_cue_text(&text, source.sample_rate.max(1)).map_err(Error::new)?;
-        let matched = parsed
-            .iter()
-            .find(|candidate| candidate.file_name == file.file_name)
-            .or_else(|| parsed.first());
-        let Some(matched) = matched else {
+        let (audio, source) = source_for_cue_file(path, &text, &album, &file.file_name)?;
+        referenced.push(audio);
+        let Some(source) = source else {
             continue;
         };
-        let album = if album.is_empty() {
-            source.album.clone()
-        } else {
-            album.clone()
-        };
-        let segments = segments_from_cue(&matched.tracks, source.presentation_frames, &album);
-        if segments.is_empty() {
-            source.warning = Some("the cue sheet did not produce any tracks inside the file".into());
-        } else {
-            apply_segments(&mut source, segments, &album);
+        emitted = true;
+        if !emit(source) {
+            return Ok(false);
         }
-        sources.push(source);
     }
-    if sources.is_empty() {
+    if !emitted {
         return Err(Error::new("the cue sheet has no readable audio"));
     }
-    Ok((sources, referenced))
+    Ok(true)
+}
+
+fn source_for_cue_file(
+    cue_path: &Path,
+    text: &str,
+    album: &str,
+    file_name: &str,
+) -> Result<(PathBuf, Option<Source>), Error> {
+    let audio = resolve_cue_file(cue_path, file_name).ok_or_else(|| {
+        Error::new(format!("cue sheet file \"{file_name}\" was not found"))
+    })?;
+    let mut source = probe_audio(&audio, CueMode::Discover)?;
+    let parsed = parse_cue_text(text, source.sample_rate.max(1)).map_err(Error::new)?;
+    let matched = parsed
+        .iter()
+        .find(|candidate| candidate.file_name == file_name)
+        .or_else(|| parsed.first());
+    let Some(matched) = matched else {
+        return Ok((audio, None));
+    };
+    let album = if album.is_empty() {
+        source.album.clone()
+    } else {
+        album.to_string()
+    };
+    let segments = segments_from_cue(&matched.tracks, source.presentation_frames, &album);
+    if segments.is_empty() {
+        source.warning = Some("the cue sheet did not produce any tracks inside the file".into());
+    } else {
+        apply_segments(&mut source, segments, &album);
+    }
+    Ok((audio, Some(source)))
 }
 
 fn resolve_cue_file(cue_path: &Path, name: &str) -> Option<PathBuf> {
@@ -844,6 +971,24 @@ mod tests {
         } else {
             None
         }
+    }
+
+    #[test]
+    fn load_paths_each_stops_when_asked_and_keeps_order() {
+        let missing_a = PathBuf::from("/no/such/seasound-a.mp3");
+        let missing_b = PathBuf::from("/no/such/seasound-b.flac");
+        let mut paths = Vec::new();
+        load_paths_each(&[missing_a.clone(), missing_b.clone()], |source| {
+            paths.push(source.path);
+            source.error.is_some()
+        });
+        assert_eq!(paths, vec![missing_a.clone(), missing_b.clone()]);
+        let mut first_only = Vec::new();
+        load_paths_each(&[missing_a.clone(), missing_b], |source| {
+            first_only.push(source.path);
+            false
+        });
+        assert_eq!(first_only, vec![missing_a]);
     }
 
     #[test]

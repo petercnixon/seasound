@@ -77,6 +77,8 @@ pub enum Command {
     },
     /// Add rows. Playback of the current file continues.
     Append(Playlist),
+    /// Put the full playlist in place. If the playing source is still in it, audio continues.
+    ReplacePlaylist(Playlist),
     Clear,
     PlayIndex(usize),
     TogglePause,
@@ -275,6 +277,11 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
                 if let Some(index) = deck.first_playable() {
                     deck.begin(index, output);
                 }
+            }
+        }
+        Command::ReplacePlaylist(playlist) => {
+            if !deck.replace_keeping_playback(playlist) {
+                deck.halt(output);
             }
         }
         Command::Append(extra) => {
@@ -509,6 +516,44 @@ impl Deck {
         }
     }
 
+    /// `true` when the playing row is still in `playlist` and audio was left running.
+    fn replace_keeping_playback(&mut self, playlist: Playlist) -> bool {
+        let current = self.current_entry();
+        let kept = current.as_ref().is_some_and(|entry| {
+            playlist.source(entry.source_id).is_some()
+                && playlist.entries.iter().any(|row| {
+                    row.source_id == entry.source_id && row.segment == entry.segment
+                })
+        });
+        if !kept {
+            self.install(playlist);
+            return false;
+        }
+        let repeat = self.cursor.repeat();
+        let shuffle = self.cursor.shuffle();
+        let new_index = current.and_then(|entry| {
+            playlist.entries.iter().position(|row| {
+                row.source_id == entry.source_id && row.segment == entry.segment
+            })
+        });
+        self.playlist = playlist;
+        self.cursor = seasound_model::Cursor::new(self.playlist.entries.len());
+        self.cursor.set_repeat(repeat);
+        self.cursor.set_shuffle(shuffle);
+        self.cursor.set_index(new_index);
+        self.display_index = new_index;
+        self.refresh_rows();
+        if self
+            .inflight
+            .as_ref()
+            .is_some_and(|inflight| self.playlist.source(inflight.id).is_none())
+        {
+            self.inflight = None;
+        }
+        self.consider_prefetch();
+        true
+    }
+
     fn install(&mut self, playlist: Playlist) {
         self.playlist = playlist;
         self.cursor = seasound_model::Cursor::new(self.playlist.entries.len());
@@ -535,6 +580,18 @@ impl Deck {
 
     fn refresh_rows(&mut self) {
         self.rows = Arc::new(self.playlist.rows());
+    }
+
+    /// Remember why this file cannot play, then let the cursor move on.
+    fn mark_unplayable(&mut self, id: SourceId, message: &str) {
+        let message = message.to_string();
+        if let Some(source) = self.playlist.sources.iter_mut().find(|source| source.id == id) {
+            if source.error.is_none() {
+                source.error = Some(message.clone());
+            }
+        }
+        self.error = Some(message);
+        self.refresh_rows();
     }
 
     fn playable(&self, index: usize) -> bool {
@@ -615,11 +672,24 @@ impl Deck {
                 continue;
             }
             let job = self.job(index)?;
-            if !self.ensure(job.source_id)? {
-                return Ok(Fill {
-                    frames: written,
-                    waiting: true,
-                });
+            match self.ensure(job.source_id) {
+                Ok(false) => {
+                    return Ok(Fill {
+                        frames: written,
+                        waiting: true,
+                    });
+                }
+                Ok(true) => {}
+                Err(err) => {
+                    // The row stays. A bad path, a down network, or garbage timing
+                    // must not stop the rest of the playlist.
+                    self.mark_unplayable(job.source_id, err.message());
+                    self.seek_frame = None;
+                    if self.advance_from(index).is_none() {
+                        break;
+                    }
+                    continue;
+                }
             }
             // `job` already captured `seek_frame`. Drop it only now, so a fill that
             // had to wait for the decoder builds the same job again.
@@ -627,8 +697,19 @@ impl Deck {
                 self.seek_frame = None;
             }
             let flush = !self.continues_after(index);
-            let pulled = self.core.pull(job, &mut out[written * 2..], flush)?;
+            let pulled = match self.core.pull(job, &mut out[written * 2..], flush) {
+                Ok(pulled) => pulled,
+                Err(err) => {
+                    self.mark_unplayable(job.source_id, err.message());
+                    self.seek_frame = None;
+                    if self.advance_from(index).is_none() {
+                        break;
+                    }
+                    continue;
+                }
+            };
             if pulled.frames > 0 {
+                self.error = None;
                 self.spans.push(Span {
                     source_id: job.source_id,
                     segment: self.playlist.entries.get(index).map(|entry| entry.segment).unwrap_or(0),
@@ -999,7 +1080,9 @@ fn publish(deck: &Deck, output: &dyn AudioOut, published: &Mutex<Snapshot>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seasound_model::{AudioFormat, ChannelMap, Playlist, Segment, Source, SourceId};
+    use seasound_model::{
+        AudioFormat, ChannelMap, Playlist, PlaylistEntry, Segment, Source, SourceId,
+    };
 
     struct Ramp {
         len: u64,
@@ -1312,6 +1395,132 @@ mod tests {
             "playback started at {first}, not halfway through the second track"
         );
         assert_eq!(engine.snapshot().title, "b");
+    }
+
+    #[test]
+    fn a_file_that_fails_to_open_is_skipped() {
+        let opener: Opener = Arc::new(|source| {
+            if source.path.ends_with("missing.flac") {
+                Err(Error::new("missing.flac is not available"))
+            } else {
+                Ok(Box::new(Ramp {
+                    len: source.presentation_frames,
+                    pos: 0,
+                }))
+            }
+        });
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let engine = Engine::start_with(opener, Box::new(memory));
+        let frames = 44_100 * 60;
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("missing.flac", frames), source("next.flac", frames)]),
+            autoplay: true,
+            start: None,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let heard = recorded.lock().unwrap().len();
+            if snapshot.state == PlayState::Playing && snapshot.title == "next.flac" && heard > 8 {
+                assert!(snapshot.error.is_none(), "{}", snapshot.error.clone().unwrap_or_default());
+                assert_eq!(snapshot.index, Some(1));
+                assert!(snapshot.rows[0].error.is_some());
+                assert!(snapshot.rows[1].error.is_none());
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "playback did not move past the missing file: {:?} {} index {:?}",
+                    snapshot.state,
+                    snapshot.error.unwrap_or_default(),
+                    snapshot.index
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn adding_the_rest_of_a_playlist_does_not_restart_the_playing_file() {
+        let frames = 44_100 * 60 * 30;
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let opener: Opener = Arc::new(|source| {
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let engine = Engine::start_with(opener, Box::new(memory));
+        let playing = Playlist::new(vec![source("chapter", frames)]);
+        let playing_id = playing.sources[0].id;
+        engine.command(Command::SetPlaylist {
+            playlist: playing,
+            autoplay: true,
+            start: None,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot.position_frames > 8_000 && recorded.lock().unwrap().len() > 16 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "playback did not advance: {:?} {}",
+                    snapshot.state,
+                    snapshot.error.unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let before = engine.snapshot().position_frames;
+        let intro = Playlist::new(vec![source("intro", frames)]);
+        let intro_id = intro.sources[0].id;
+        let mut chapter = source("chapter", frames);
+        chapter.id = playing_id;
+        let mut full = Playlist::empty();
+        full.sources = vec![intro.sources[0].clone(), chapter];
+        full.entries = vec![
+            PlaylistEntry {
+                source_id: intro_id,
+                segment: 0,
+            },
+            PlaylistEntry {
+                source_id: playing_id,
+                segment: 0,
+            },
+        ];
+        engine.command(Command::ReplacePlaylist(full));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let continued = snapshot.index == Some(1)
+                && snapshot.title == "chapter"
+                && snapshot.state == PlayState::Playing
+                && snapshot.position_frames + 4_000 >= before;
+            if continued {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "replace restarted playback: state {:?} index {:?} title {} position {} before {before} {}",
+                    snapshot.state,
+                    snapshot.index,
+                    snapshot.title,
+                    snapshot.position_frames,
+                    snapshot.error.unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let samples = recorded.lock().unwrap();
+        let last = samples[samples.len() - 2];
+        assert!(
+            last > 1_000.0,
+            "audio restarted near the beginning ({last})"
+        );
     }
 
     #[test]
