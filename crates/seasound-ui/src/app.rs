@@ -902,7 +902,7 @@ impl SeaSoundApp {
                         "On exit, SeaSound saves the playlist in the app, the current track, and the position. The next launch plays that track from the saved position. This is the playlist in the window, not a playlist file you opened. Save playlist stores that same place in the file. Open playlist plays the file from there when this is on.",
                     )
                     .size(13.0)
-                    .color(ui.visuals().weak_text_color()),
+                    .color(theme::current(ui.ctx()).weak_text.0),
                 );
                 ui.add_space(12.0);
                 let mut auto_save = self.auto_save_playlists;
