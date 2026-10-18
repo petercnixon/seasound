@@ -7,6 +7,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use symphonia::core::io::MediaSource;
+
 use crate::cue::{cue_album_title, CueTrack};
 
 #[derive(Clone, Debug, Default)]
@@ -261,6 +263,89 @@ pub fn cuesheet_lead_out(body: &[u8]) -> Option<u64> {
     None
 }
 
+/// Open a file for Symphonia. A FLAC file's cuesheet blocks are shown to it as padding.
+///
+/// Symphonia rejects the whole stream when a cuesheet breaks a CD-DA rule, for example a
+/// non-zero lead-in with the CD-DA flag clear, or an offset that is not a multiple of 588.
+/// Sheets made up for a joined album often do. The cue rows come from `read_flac_meta`, so
+/// Symphonia never needs the block. Only the block type byte is changed, and only in memory.
+pub fn open_media_source(path: &Path) -> std::io::Result<Box<dyn MediaSource>> {
+    let mut file = File::open(path)?;
+    let patches = cuesheet_type_bytes(&mut file).unwrap_or_default();
+    file.seek(SeekFrom::Start(0))?;
+    if patches.is_empty() {
+        return Ok(Box::new(file));
+    }
+    Ok(Box::new(MaskedFlac {
+        file,
+        pos: 0,
+        patches,
+    }))
+}
+
+/// Byte offsets of the header type byte of every cuesheet block.
+fn cuesheet_type_bytes(file: &mut File) -> Option<Vec<u64>> {
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+    if &magic != b"fLaC" {
+        return None;
+    }
+    let mut offsets = Vec::new();
+    let mut pos = 4u64;
+    loop {
+        let mut header = [0u8; 4];
+        file.read_exact(&mut header).ok()?;
+        let length = (u64::from(header[1]) << 16) | (u64::from(header[2]) << 8) | u64::from(header[3]);
+        if header[0] & 0x7f == 5 {
+            offsets.push(pos);
+        }
+        if header[0] & 0x80 != 0 {
+            break;
+        }
+        pos += 4 + length;
+        file.seek(SeekFrom::Start(pos)).ok()?;
+    }
+    Some(offsets)
+}
+
+struct MaskedFlac {
+    file: File,
+    pos: u64,
+    patches: Vec<u64>,
+}
+
+impl Read for MaskedFlac {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        for &offset in &self.patches {
+            if offset >= self.pos && offset < self.pos + n as u64 {
+                let byte = &mut buf[(offset - self.pos) as usize];
+                // Keep the last-block flag. Type 1 is padding.
+                *byte = (*byte & 0x80) | 1;
+            }
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for MaskedFlac {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.pos = self.file.seek(to)?;
+        Ok(self.pos)
+    }
+}
+
+impl MediaSource for MaskedFlac {
+    fn is_seekable(&self) -> bool {
+        self.file.is_seekable()
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.file.byte_len()
+    }
+}
+
 /// End of the last cue track: the lead-out if it sits inside the file, otherwise the file.
 pub fn cue_end(lead_out: Option<u64>, presentation_frames: u64) -> u64 {
     match lead_out {
@@ -299,6 +384,32 @@ mod tests {
         push_track(&mut body, 44100, 2, &[(1, 0)]);
         push_track(&mut body, 88200, 170, &[]);
         body
+    }
+
+    #[test]
+    fn cuesheet_blocks_read_as_padding_and_nothing_else_changes() {
+        let mut bytes = b"fLaC".to_vec();
+        bytes.extend_from_slice(&[0x00, 0, 0, 2, 0xaa, 0xbb]);
+        bytes.extend_from_slice(&[0x05, 0, 0, 1, 0xcc]);
+        bytes.extend_from_slice(&[0x85, 0, 0, 1, 0xdd]);
+        bytes.extend_from_slice(&[0xff, 0xf8, 0x05]);
+        let path = std::env::temp_dir().join(format!("seasound-mask-{}.flac", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut source = open_media_source(&path).unwrap();
+        let mut seen = Vec::new();
+        // One byte at a time, so each patch lands at a different read position.
+        let mut byte = [0u8; 1];
+        while source.read(&mut byte).unwrap() == 1 {
+            seen.push(byte[0]);
+        }
+        source.seek(SeekFrom::Start(15)).unwrap();
+        source.read_exact(&mut byte).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut expected = bytes.clone();
+        expected[10] = 0x01;
+        expected[15] = 0x81;
+        assert_eq!(seen, expected);
+        assert_eq!(byte[0], 0x81);
     }
 
     #[test]

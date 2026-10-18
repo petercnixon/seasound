@@ -700,8 +700,8 @@ fn scale_trim(trim: Trim, clock: u32, rate: u32) -> Trim {
 }
 
 fn stream_info(path: &Path) -> Result<StreamInfo, Error> {
-    let file = std::fs::File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let source = crate::flac::open_media_source(path)?;
+    let mss = MediaSourceStream::new(source, Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
         hint.with_extension(ext);
@@ -1093,6 +1093,28 @@ mod tests {
             source.bits_per_sample
         );
         assert!(source.bitrate_bps > 200_000, "bitrate {}", source.bitrate_bps);
+    }
+
+    #[test]
+    fn flac_with_a_cuesheet_symphonia_rejects_still_plays() {
+        let Some(examples) = examples() else {
+            return;
+        };
+        // CD-DA flag clear with a non-zero lead-in, and a lead-out off the 588 grid.
+        let path = examples.join("1989 - Red Hot Chili Peppers - Mother's Milk.flac");
+        if !path.is_file() {
+            return;
+        }
+        let source = probe_file(&path);
+        assert!(source.error.is_none(), "{:?}", source.error);
+        assert_eq!(source.segments.len(), 17);
+        assert_eq!(source.segments[0].title, "Good Time Boys");
+        assert_eq!(source.segments.last().unwrap().end_frame, source.presentation_frames);
+        let mut decoder =
+            crate::decode::open_decoder(&path, seasound_model::DecodeParams::from(&source)).unwrap();
+        decoder.seek_presentation(source.segments[1].start_frame).unwrap();
+        let mut samples = vec![0f32; 4096];
+        assert!(decoder.pull(&mut samples).unwrap() > 0);
     }
 
     #[test]
