@@ -95,23 +95,45 @@ impl SymphoniaSource {
                 "Opus is not supported yet. The pre-skip in this Symphonia version is incomplete.",
             ));
         }
-        if let Some(extra) = track.codec_params.extra_data.as_deref() {
-            if is_he_aac(extra) {
-                return Err(Error::new(
-                    "HE-AAC is not supported. SeaSound decodes AAC-LC.",
-                ));
-            }
-        }
-        let sample_rate = track
+        let container_rate = track
             .codec_params
             .sample_rate
             .ok_or_else(|| Error::new("the file has no sample rate"))?;
-        let channels = track
+        let container_channels = track
             .codec_params
             .channels
             .map(|channels| channels.count() as u16)
-            .filter(|count| *count > 0)
-            .unwrap_or(2);
+            .filter(|count| *count > 0);
+        // Same core rate and channel count as the probe. The container rate is
+        // the HE-AAC output rate, and codec_params.channels is empty for MP4 AAC.
+        let (sample_rate, channels) = if codec == symphonia::core::codecs::CODEC_TYPE_AAC {
+            match track
+                .codec_params
+                .extra_data
+                .as_deref()
+                .and_then(crate::aac::parse)
+            {
+                Some(cfg) => {
+                    let rate = if cfg.core_rate > 0 {
+                        cfg.core_rate
+                    } else {
+                        container_rate
+                    };
+                    let channels = if cfg.core_channels > 0 {
+                        cfg.core_channels
+                    } else {
+                        container_channels.unwrap_or(0)
+                    };
+                    (rate, channels)
+                }
+                None => (container_rate, container_channels.unwrap_or(0)),
+            }
+        } else {
+            (container_rate, container_channels.unwrap_or(2))
+        };
+        if sample_rate == 0 || channels == 0 {
+            return Err(Error::new("the file has no sample rate or channel count"));
+        }
         let map = channel_map(channels);
         let presentation_frames = if params.presentation_frames == 0 {
             u64::MAX / 4
@@ -335,16 +357,6 @@ fn channel_map(channels: u16) -> ChannelMap {
         6 => ChannelMap::Surround51,
         n => ChannelMap::Other(n),
     }
-}
-
-/// AudioSpecificConfig: the first five bits are the audio object type.
-/// 2 is AAC-LC. 5 is HE-AAC. 29 is HE-AAC v2.
-fn is_he_aac(extra: &[u8]) -> bool {
-    if extra.is_empty() {
-        return false;
-    }
-    let aot = extra[0] >> 3;
-    aot == 5 || aot == 29
 }
 
 #[cfg(test)]
@@ -590,6 +602,117 @@ mod tests {
             .zip(right)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn aac_channel_count_matches_ffmpeg_and_he_aac_is_not_double_speed() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        if !root.is_dir() {
+            return;
+        }
+        let stereo = root.join("ACC with chapters.m4a");
+        if stereo.is_file() {
+            let probed = crate::probe::probe_file(&stereo);
+            assert_eq!(probed.channels, 2);
+            assert_eq!(probed.sample_rate, 44_100);
+            let decoder = open_decoder(&stereo, DecodeParams::from(&probed)).unwrap();
+            assert_eq!(decoder.channels(), probed.channels);
+            assert_eq!(decoder.sample_rate(), probed.sample_rate);
+            let ours = pull_frames(&stereo, probed.delay, probed.padding, 44_100, 0);
+            if let Some(ffmpeg) = ffmpeg_f32le(&[
+                "-i",
+                stereo.to_str().unwrap(),
+                "-t",
+                "1",
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "-",
+            ]) {
+                let n = ours.len().min(ffmpeg.len());
+                assert!(n > 44_100, "decoded {n} samples");
+                let diff = max_abs_diff(&ours[..n], &ffmpeg[..n]);
+                assert!(
+                    diff < 0.02,
+                    "stereo AAC differs from ffmpeg by {diff} (a 2x read looks like a large diff)"
+                );
+            }
+        }
+
+        let fast = root.join("Fast AAC.m4a");
+        if fast.is_file() {
+            let probed = crate::probe::probe_file(&fast);
+            assert_eq!(probed.channels, 1);
+            assert_eq!(probed.sample_rate, 44_100);
+            let decoder = open_decoder(&fast, DecodeParams::from(&probed)).unwrap();
+            assert_eq!(decoder.channels(), 1);
+            assert_eq!(decoder.sample_rate(), 44_100);
+            let seconds = probed.presentation_frames as f64 / f64::from(probed.sample_rate);
+            assert!((seconds - 348.35).abs() < 0.05, "duration {seconds}");
+            // One second is enough to show the mono samples are not paired into stereo frames.
+            let ours = pull_frames(&fast, 0, 0, 44_100, 0);
+            assert_eq!(ours.len(), 44_100);
+            if let Some(ffmpeg) = ffmpeg_f32le(&[
+                "-i",
+                fast.to_str().unwrap(),
+                "-t",
+                "1",
+                "-f",
+                "f32le",
+                "-acodec",
+                "pcm_f32le",
+                "-",
+            ]) {
+                let n = ours.len().min(ffmpeg.len());
+                let diff = max_abs_diff(&ours[..n], &ffmpeg[..n]);
+                assert!(diff < 0.02, "mono AAC differs from ffmpeg by {diff}");
+            }
+        }
+
+        for (name, channels, packets) in [
+            ("HE-AAC/SBRtestStereoAot5Sig1.mp4", 2u16, 707u64),
+            ("HE-AAC/SBRtestStereoAot29Sig1.mp4", 1, 729),
+        ] {
+            let path = root.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let probed = crate::probe::probe_file(&path);
+            assert_eq!(probed.sample_rate, 22_050, "{name}");
+            assert_eq!(probed.channels, channels, "{name}");
+            let mut decoder = open_decoder(
+                &path,
+                DecodeParams {
+                    delay: 0,
+                    padding: 0,
+                    presentation_frames: u64::MAX / 4,
+                },
+            )
+            .unwrap();
+            assert_eq!(decoder.sample_rate(), 22_050, "{name}");
+            assert_eq!(decoder.channels(), channels, "{name}");
+            let mut got = 0u64;
+            let mut buf = vec![0f32; 4096 * channels as usize];
+            loop {
+                let n = decoder.pull(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got += n as u64;
+            }
+            // One AAC-LC frame is 1024 core samples. SBR would emit 2048 at 44100.
+            assert_eq!(got, packets * 1024, "{name}");
+            let played = (got - probed.delay) as f64 / 22_050.0;
+            let expected = probed.presentation_frames as f64 / 22_050.0;
+            assert!(
+                (played - expected).abs() < 0.05,
+                "{name} decoded {played:.3}s, probe says {expected:.3}s"
+            );
+            // The container duration is about 33s at 44100. Playing the core at
+            // 44100 would finish in about half that time.
+            assert!(played > 30.0, "{name} finished in {played:.3}s");
+        }
     }
 
 }

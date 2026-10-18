@@ -421,12 +421,6 @@ fn probe_audio(path: &Path, cue: CueMode) -> Result<Source, Error> {
         return Err(Error::new(format!("{} does not exist", path.display())));
     }
     let info = stream_info(path)?;
-    if info.he_aac {
-        return Ok(error_source(
-            path,
-            "HE-AAC is not supported. SeaSound decodes AAC-LC.",
-        ));
-    }
     let tags = read_tags(path);
     let flac = if info.format == AudioFormat::Flac {
         read_flac_meta(path)
@@ -437,8 +431,12 @@ fn probe_audio(path: &Path, cue: CueMode) -> Result<Source, Error> {
     let trim = match info.format {
         AudioFormat::Mp3 => gapless::read_mp3_info(path).trim,
         AudioFormat::Aac | AudioFormat::Alac => {
-            let itun = gapless::read_mp4_itunsmpb(path);
-            let elst = gapless::read_mp4_priming(path);
+            // Edit-list and iTunSMPB counts are in the media timescale. HE-AAC's
+            // timescale is the SBR output rate, and playback is on the core clock.
+            let itun = gapless::read_mp4_itunsmpb(path)
+                .map(|trim| scale_trim(trim, info.clock, info.sample_rate));
+            let elst = gapless::read_mp4_priming(path)
+                .map(|samples| crate::aac::scale_count(samples, info.clock, info.sample_rate));
             gapless::choose_trim(None, itun, elst, info.decoded_frames)
         }
         _ => Trim::none(),
@@ -681,11 +679,24 @@ fn whole_file_segment(source: &Source) -> Segment {
 
 struct StreamInfo {
     format: AudioFormat,
+    /// Rate of the PCM the decoder emits.
     sample_rate: u32,
     channels: u16,
     bits_per_sample: u16,
+    /// PCM frames at `sample_rate`, including encoder delay.
     decoded_frames: Option<u64>,
-    he_aac: bool,
+    /// Timescale of the container counts before they were converted onto `sample_rate`.
+    clock: u32,
+}
+
+fn scale_trim(trim: Trim, clock: u32, rate: u32) -> Trim {
+    Trim {
+        delay: crate::aac::scale_count(trim.delay, clock, rate),
+        padding: crate::aac::scale_count(trim.padding, clock, rate),
+        valid: trim
+            .valid
+            .map(|valid| crate::aac::scale_count(valid, clock, rate)),
+    }
 }
 
 fn stream_info(path: &Path) -> Result<StreamInfo, Error> {
@@ -716,23 +727,52 @@ fn stream_info(path: &Path) -> Result<StreamInfo, Error> {
             "Opus is not supported yet. The pre-skip in this Symphonia version is incomplete.",
         ));
     }
-    let he_aac = track
-        .codec_params
-        .extra_data
-        .as_deref()
-        .is_some_and(|extra| !extra.is_empty() && (extra[0] >> 3 == 5 || extra[0] >> 3 == 29));
     let audio_format = classify_codec(codec, path);
+    let container_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let mut sample_rate = container_rate;
+    let mut channels = track
+        .codec_params
+        .channels
+        .map(|channels| channels.count() as u16)
+        .unwrap_or(0);
+    // MP4 stores the AAC channel count and the core rate only in the
+    // AudioSpecificConfig. `n_frames` is in the media timescale, which for
+    // HE-AAC is the output rate, so a core timeline has half as many frames.
+    let mut clock = sample_rate;
+    if codec == CODEC_TYPE_AAC {
+        if let Some(base) = track.codec_params.time_base {
+            if base.numer == 1 && base.denom > 0 {
+                clock = base.denom;
+            }
+        }
+        if let Some(cfg) = track
+            .codec_params
+            .extra_data
+            .as_deref()
+            .and_then(crate::aac::parse)
+        {
+            if cfg.core_rate > 0 {
+                sample_rate = cfg.core_rate;
+            }
+            if cfg.core_channels > 0 {
+                channels = cfg.core_channels;
+            }
+        }
+    }
+    let decoded_frames = track.codec_params.n_frames.map(|frames| {
+        if codec == CODEC_TYPE_AAC {
+            crate::aac::scale_count(frames, clock, sample_rate)
+        } else {
+            frames
+        }
+    });
     Ok(StreamInfo {
         format: audio_format,
-        sample_rate: track.codec_params.sample_rate.unwrap_or(0),
-        channels: track
-            .codec_params
-            .channels
-            .map(|channels| channels.count() as u16)
-            .unwrap_or(0),
+        sample_rate,
+        channels,
         bits_per_sample: display_bits(audio_format, &track.codec_params),
-        decoded_frames: track.codec_params.n_frames,
-        he_aac,
+        decoded_frames,
+        clock,
     })
 }
 
@@ -1087,10 +1127,39 @@ mod tests {
         assert_eq!(source.delay, 2112, "iTunSMPB priming");
         assert_eq!(source.padding, 0x190);
         assert_eq!(source.format, AudioFormat::Aac);
-        assert!(source.channels >= 1);
+        assert_eq!(source.channels, 2);
+        assert_eq!(source.sample_rate, 44_100);
         assert_eq!(source.bits_per_sample, 0);
         let kbps = source.bitrate_bps / 1000;
         assert!((32..=512).contains(&kbps), "bitrate {kbps} kbps");
+    }
+
+    #[test]
+    fn he_aac_examples_use_the_core_clock_and_channel_count() {
+        let Some(examples) = examples() else {
+            return;
+        };
+        let cases = [
+            ("HE-AAC/SBRtestStereoAot5Sig1.mp4", 22_050, 2u16, 1_637u64, 32.7),
+            ("HE-AAC/SBRtestStereoAot29Sig1.mp4", 22_050, 1, 2_559, 33.7),
+            ("Fast AAC.m4a", 44_100, 1, 0, 348.3),
+        ];
+        for (name, rate, channels, delay, seconds) in cases {
+            let path = examples.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let source = probe_file(&path);
+            assert!(source.error.is_none(), "{}: {:?}", name, source.error);
+            assert_eq!(source.sample_rate, rate, "{name}");
+            assert_eq!(source.channels, channels, "{name}");
+            assert_eq!(source.delay, delay, "{name}");
+            let played = source.presentation_frames as f64 / f64::from(source.sample_rate);
+            assert!(
+                (played - seconds).abs() < 0.15,
+                "{name} plays for {played:.3}s, expected about {seconds}"
+            );
+        }
     }
 
     #[test]

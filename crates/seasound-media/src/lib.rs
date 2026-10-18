@@ -3,6 +3,7 @@
 //! The playback crate never parses a container. It receives a [`PcmSource`] whose `pull`
 //! already skips encoder delay and stops before encoder padding.
 
+mod aac;
 mod chapters;
 mod cue;
 mod decode;

@@ -30,7 +30,9 @@ Do not `cargo fmt` the whole tree. Do not `cargo update` unless a compile failur
 
 ## What plays
 
-MP3, AAC-LC in M4A/M4B/MP4, FLAC, ALAC, WAV, AIFF, and Vorbis in Ogg. HE-AAC (Audio Object Type 5 or 29) is an error row. Opus is an error row. The probe also accepts a sibling `.cue`, a `.cue` dropped on its own, and `.m3u` / `.m3u8`.
+MP3, AAC in M4A/M4B/MP4 (AAC-LC and the AAC-LC core of HE-AAC), FLAC, ALAC, WAV, AIFF, and Vorbis in Ogg. Opus is an error row. The probe also accepts a sibling `.cue`, a `.cue` dropped on its own, and `.m3u` / `.m3u8`.
+
+HE-AAC is not an error row. Symphonia does not apply spectral band replication or parametric stereo, so playback is the AAC-LC core. The MP4 sample entry carries the rate after SBR (often twice the core) and does not carry the channel count. Both come from the AudioSpecificConfig. Object type 5 or 29 at the start is the hierarchical form. Backward-compatible files start with object type 2 and signal SBR after the sync word `0x2b7` (and parametric stereo after `0x548`). Using the container rate, or assuming two channels when the core is mono, plays the file fast. HE-AAC v2's core is mono.
 
 Decoder plugins are shared libraries (`libseasound_*.so`). The host is `seasound-media`; the ABI is `seasound-plugin-api`. Built-in extensions are never handed to a plugin. Plugins are scanned from `SEASOUND_PLUGIN_DIR`, then `plugins/` next to the executable, then `plugins/` in the config directory. The first plugin id wins. A plugin is used when it loaded and its id is not in `settings.json` `disabled_plugins`. The Plugins menu toggles that. The WavPack plugin (`plugins/seasound-decoder-wavpack`, id `wavpack`) plays lossless mono and stereo `.wv`. It decodes the file into memory on open. `third_party/wavicle` is wavicle 0.1.0 with `is_multiple_of` rewritten so Rust 1.86 can build it. Do not raise `rust-version` for that.
 
@@ -110,4 +112,4 @@ This is a native window, not a web app. Verify UI changes by running `target/deb
 
 ## Out of scope
 
-Library view, tag editing, EQ, ReplayGain, loudness normalization, lyrics, streaming, CD ripping, HE-AAC, Opus, a web build, the LAME bit reservoir, output or DSP plugins, and unloading a plugin while it is in use.
+Library view, tag editing, EQ, ReplayGain, loudness normalization, lyrics, streaming, CD ripping, SBR and parametric stereo synthesis, Opus, a web build, the LAME bit reservoir, output or DSP plugins, and unloading a plugin while it is in use.
