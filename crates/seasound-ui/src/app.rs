@@ -67,7 +67,7 @@ pub struct SeaSoundApp {
     auto_save_playlists: bool,
     session: Option<SessionPlayback>,
     settings_open: bool,
-    columns: ColumnWidths,
+    columns: ColumnLayout,
     themes: Themes,
     themes_dir: Option<PathBuf>,
     /// Name of the chosen theme. Kept when the file is missing so it comes back on reload.
@@ -197,7 +197,7 @@ struct Settings {
     session: Option<SessionPlayback>,
     /// Playlist column widths set by dragging the header.
     #[serde(default)]
-    columns: ColumnWidths,
+    columns: ColumnLayout,
     /// Theme name. Built-in themes and `*.json` files in `themes/` of the config directory.
     #[serde(default = "default_theme")]
     theme: String,
@@ -238,7 +238,7 @@ impl Default for Settings {
             resume_playback: default_resume_playback(),
             auto_save_playlists: default_auto_save_playlists(),
             session: None,
-            columns: ColumnWidths::default(),
+            columns: ColumnLayout::default(),
             theme: default_theme(),
         }
     }
@@ -1421,16 +1421,22 @@ impl SeaSoundApp {
                 } else {
                     row.number.to_string()
                 };
-                paint_text(ui, columns.number, &number, color, false, egui::Align2::LEFT_CENTER);
-                paint_text(ui, columns.title, &row_title(row), color, playing, egui::Align2::LEFT_CENTER);
-                paint_text(ui, columns.artist, &row.artist, color, false, egui::Align2::LEFT_CENTER);
-                paint_text(ui, columns.album, &row.album, color, false, egui::Align2::LEFT_CENTER);
                 let time = if let Some(error) = &row.error {
                     error.clone()
                 } else {
                     format_time(row.frames, row.sample_rate.max(1))
                 };
-                paint_text(ui, columns.time, &time, color, false, egui::Align2::RIGHT_CENTER);
+                let title = row_title(row);
+                for (kind, column) in columns {
+                    let (text, strong) = match kind {
+                        ColumnKind::Number => (number.as_str(), false),
+                        ColumnKind::Title => (title.as_str(), playing),
+                        ColumnKind::Artist => (row.artist.as_str(), false),
+                        ColumnKind::Album => (row.album.as_str(), false),
+                        ColumnKind::Time => (time.as_str(), false),
+                    };
+                    paint_text(ui, column, text, color, strong, kind.align());
+                }
                 if let Some(error) = &row.error {
                     slot.response.clone().on_hover_text(error.as_str());
                 } else if let Some(warning) = self.warnings.get(&row.source_id) {
@@ -1655,7 +1661,7 @@ impl SeaSoundApp {
             } else {
                 None
             },
-            columns: self.columns,
+            columns: self.columns.clone(),
             theme: self.theme_name.clone(),
         };
         if let Some(parent) = path.parent() {
@@ -2506,14 +2512,6 @@ fn consume(ctx: &egui::Context, key: egui::Key) -> bool {
 }
 
 
-struct Columns {
-    number: egui::Rect,
-    title: egui::Rect,
-    artist: egui::Rect,
-    album: egui::Rect,
-    time: egui::Rect,
-}
-
 const COLUMN_PAD: f32 = 8.0;
 const MIN_NUMBER: f32 = 24.0;
 const MIN_TITLE: f32 = 60.0;
@@ -2522,9 +2520,56 @@ const MIN_TIME: f32 = 48.0;
 /// Pointer distance from a header divider that grabs it.
 const DIVIDER_GRAB: f32 = 4.0;
 
-/// Widths of the fixed playlist columns, in points. Title takes what is left.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-struct ColumnWidths {
+/// One playlist column. Title has no stored width. It takes what the others leave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ColumnKind {
+    Number,
+    Title,
+    Artist,
+    Album,
+    Time,
+}
+
+impl ColumnKind {
+    const ALL: [ColumnKind; 5] = [
+        ColumnKind::Number,
+        ColumnKind::Title,
+        ColumnKind::Artist,
+        ColumnKind::Album,
+        ColumnKind::Time,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ColumnKind::Number => "#",
+            ColumnKind::Title => "Title",
+            ColumnKind::Artist => "Artist",
+            ColumnKind::Album => "Album",
+            ColumnKind::Time => "Time",
+        }
+    }
+
+    fn align(self) -> egui::Align2 {
+        match self {
+            ColumnKind::Time => egui::Align2::RIGHT_CENTER,
+            _ => egui::Align2::LEFT_CENTER,
+        }
+    }
+
+    fn min_width(self) -> f32 {
+        match self {
+            ColumnKind::Number => MIN_NUMBER,
+            ColumnKind::Title => MIN_TITLE,
+            ColumnKind::Artist | ColumnKind::Album => MIN_TEXT,
+            ColumnKind::Time => MIN_TIME,
+        }
+    }
+}
+
+/// Order and widths of the playlist columns, in points. Title takes what is left.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ColumnLayout {
     #[serde(default = "default_number_width")]
     number: f32,
     #[serde(default = "default_text_width")]
@@ -2533,6 +2578,9 @@ struct ColumnWidths {
     album: f32,
     #[serde(default = "default_time_width")]
     time: f32,
+    /// Left to right. Set by dragging a heading.
+    #[serde(default = "default_column_order")]
+    order: Vec<ColumnKind>,
 }
 
 fn default_number_width() -> f32 {
@@ -2547,27 +2595,23 @@ fn default_time_width() -> f32 {
     72.0
 }
 
-impl Default for ColumnWidths {
+fn default_column_order() -> Vec<ColumnKind> {
+    ColumnKind::ALL.to_vec()
+}
+
+impl Default for ColumnLayout {
     fn default() -> Self {
         Self {
             number: default_number_width(),
             artist: default_text_width(),
             album: default_text_width(),
             time: default_time_width(),
+            order: default_column_order(),
         }
     }
 }
 
-/// The edge between two header columns that can be dragged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Divider {
-    NumberTitle,
-    TitleArtist,
-    ArtistAlbum,
-    AlbumTime,
-}
-
-impl ColumnWidths {
+impl ColumnLayout {
     /// Replace values a hand-edited or damaged settings file could hold.
     fn sanitized(self) -> Self {
         let fix = |value: f32, min: f32, default: f32| {
@@ -2577,140 +2621,219 @@ impl ColumnWidths {
                 default
             }
         };
+        let complete = self.order.len() == ColumnKind::ALL.len()
+            && ColumnKind::ALL.iter().all(|kind| self.order.contains(kind));
         Self {
             number: fix(self.number, MIN_NUMBER, default_number_width()),
             artist: fix(self.artist, MIN_TEXT, default_text_width()),
             album: fix(self.album, MIN_TEXT, default_text_width()),
             time: fix(self.time, MIN_TIME, default_time_width()),
+            order: if complete { self.order } else { default_column_order() },
         }
     }
 
-    /// Widths used for a row of `width`. Artist and album give way when title would
-    /// fall under its minimum.
-    fn fit(&self, width: f32) -> [f32; 5] {
+    /// Stored width. Title has none and reports 0.
+    fn width(&self, kind: ColumnKind) -> f32 {
+        match kind {
+            ColumnKind::Number => self.number,
+            ColumnKind::Title => 0.0,
+            ColumnKind::Artist => self.artist,
+            ColumnKind::Album => self.album,
+            ColumnKind::Time => self.time,
+        }
+    }
+
+    fn width_mut(&mut self, kind: ColumnKind) -> Option<&mut f32> {
+        match kind {
+            ColumnKind::Number => Some(&mut self.number),
+            ColumnKind::Title => None,
+            ColumnKind::Artist => Some(&mut self.artist),
+            ColumnKind::Album => Some(&mut self.album),
+            ColumnKind::Time => Some(&mut self.time),
+        }
+    }
+
+    /// Width of each column in `order` for a row of `width`. Artist and album give way
+    /// when title would fall under its minimum.
+    fn fit(&self, width: f32) -> Vec<f32> {
         let avail = (width - COLUMN_PAD).max(0.0);
-        let mut artist = self.artist;
-        let mut album = self.album;
-        let fixed = self.number + artist + album + self.time;
+        let fixed: f32 = ColumnKind::ALL.iter().map(|&kind| self.width(kind)).sum();
         let deficit = MIN_TITLE - (avail - fixed);
-        if deficit > 0.0 {
-            let flexible = artist + album;
-            let keep = ((flexible - deficit) / flexible).max(0.0);
-            artist *= keep;
-            album *= keep;
-        }
-        let title = (avail - self.number - artist - album - self.time).max(0.0);
-        [self.number, title, artist, album, self.time]
+        let flexible = self.artist + self.album;
+        let keep = if deficit > 0.0 && flexible > 0.0 {
+            ((flexible - deficit) / flexible).max(0.0)
+        } else {
+            1.0
+        };
+        let shrunk = |kind: ColumnKind| match kind {
+            ColumnKind::Artist | ColumnKind::Album => self.width(kind) * keep,
+            _ => self.width(kind),
+        };
+        let used: f32 = ColumnKind::ALL.iter().map(|&kind| shrunk(kind)).sum();
+        let title = (avail - used).max(0.0);
+        self.order
+            .iter()
+            .map(|&kind| if kind == ColumnKind::Title { title } else { shrunk(kind) })
+            .collect()
     }
 
-    /// Move `divider` by `dx`. The columns on both sides of it trade width, so the
-    /// divider follows the pointer and the other edges stay put.
-    fn drag(&mut self, divider: Divider, dx: f32, width: f32) {
-        let [_, title, ..] = self.fit(width);
+    /// Move the divider after column `index` by `dx`. The columns on both sides trade
+    /// width, so the divider follows the pointer and the other edges stay put. Title
+    /// absorbs the change when it is on one side.
+    fn drag(&mut self, index: usize, dx: f32, width: f32) {
+        let (Some(&left), Some(&right)) = (self.order.get(index), self.order.get(index + 1)) else {
+            return;
+        };
+        let title_at = self.order.iter().position(|&kind| kind == ColumnKind::Title);
+        let title = title_at.map_or(0.0, |at| self.fit(width)[at]);
         let title_room = (title - MIN_TITLE).max(0.0);
-        match divider {
-            Divider::NumberTitle => {
-                let dx = dx.clamp(MIN_NUMBER - self.number, title_room);
-                self.number += dx;
-            }
-            Divider::TitleArtist => {
-                let dx = dx.clamp(-title_room, self.artist - MIN_TEXT);
-                self.artist -= dx;
-            }
-            Divider::ArtistAlbum => {
-                let dx = dx.clamp(MIN_TEXT - self.artist, self.album - MIN_TEXT);
-                self.artist += dx;
-                self.album -= dx;
-            }
-            Divider::AlbumTime => {
-                let dx = dx.clamp(MIN_TEXT - self.album, self.time - MIN_TIME);
-                self.album += dx;
-                self.time -= dx;
-            }
+        let lo;
+        let hi;
+        if left == ColumnKind::Title {
+            lo = -title_room;
+            hi = self.width(right) - right.min_width();
+        } else if right == ColumnKind::Title {
+            lo = left.min_width() - self.width(left);
+            hi = title_room;
+        } else {
+            lo = left.min_width() - self.width(left);
+            hi = self.width(right) - right.min_width();
+        }
+        let dx = dx.clamp(lo.min(0.0), hi.max(0.0));
+        if let Some(value) = self.width_mut(left) {
+            *value += dx;
+        }
+        if let Some(value) = self.width_mut(right) {
+            *value -= dx;
         }
     }
 
-    fn reset(&mut self, divider: Divider) {
+    /// Put both columns beside the divider after `index` back to their default widths.
+    fn reset(&mut self, index: usize) {
         let defaults = Self::default();
-        match divider {
-            Divider::NumberTitle => self.number = defaults.number,
-            Divider::TitleArtist => self.artist = defaults.artist,
-            Divider::ArtistAlbum => {
-                self.artist = defaults.artist;
-                self.album = defaults.album;
-            }
-            Divider::AlbumTime => {
-                self.album = defaults.album;
-                self.time = defaults.time;
+        for at in [index, index + 1] {
+            let Some(&kind) = self.order.get(at) else {
+                continue;
+            };
+            if let Some(value) = self.width_mut(kind) {
+                *value = defaults.width(kind);
             }
         }
     }
-}
 
-fn columns_for(rect: egui::Rect, widths: &ColumnWidths) -> Columns {
-    let y0 = rect.top();
-    let y1 = rect.bottom();
-    let mut x = rect.left() + COLUMN_PAD;
-    let mut next = |width: f32| {
-        let column = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x + width, y1));
-        x += width;
-        column
-    };
-    let [number, title, artist, album, time] = widths.fit(rect.width());
-    Columns {
-        number: next(number),
-        title: next(title),
-        artist: next(artist),
-        album: next(album),
-        time: next(time),
+    /// Move column `from` to the gap `gap`, where gap 0 is before the first column and
+    /// gap `len` is after the last. Returns false when nothing moved.
+    fn move_column(&mut self, from: usize, gap: usize) -> bool {
+        if from >= self.order.len() || gap > self.order.len() || gap == from || gap == from + 1 {
+            return false;
+        }
+        let kind = self.order.remove(from);
+        let to = if gap > from { gap - 1 } else { gap };
+        self.order.insert(to, kind);
+        true
     }
 }
 
-/// Draw the header and let its dividers be dragged. Double-click a divider to reset it.
-/// Returns true when a width changed.
-fn column_header(ui: &mut egui::Ui, widths: &mut ColumnWidths) -> bool {
+/// Each column in display order with its rectangle inside `rect`.
+fn columns_for(rect: egui::Rect, layout: &ColumnLayout) -> Vec<(ColumnKind, egui::Rect)> {
+    let mut x = rect.left() + COLUMN_PAD;
+    layout
+        .order
+        .iter()
+        .zip(layout.fit(rect.width()))
+        .map(|(&kind, width)| {
+            let column = egui::Rect::from_min_max(
+                egui::pos2(x, rect.top()),
+                egui::pos2(x + width, rect.bottom()),
+            );
+            x += width;
+            (kind, column)
+        })
+        .collect()
+}
+
+/// The gap between columns nearest to `x`. Gap 0 is the left edge of the first column.
+fn column_gap_at(columns: &[(ColumnKind, egui::Rect)], x: f32) -> usize {
+    let mut edges = Vec::with_capacity(columns.len() + 1);
+    if let Some((_, first)) = columns.first() {
+        edges.push(first.left());
+    }
+    edges.extend(columns.iter().map(|(_, column)| column.right()));
+    edges
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| (*a - x).abs().total_cmp(&(*b - x).abs()))
+        .map_or(0, |(gap, _)| gap)
+}
+
+/// Draw the header. Drag a divider to resize, double-click it to reset, and drag a
+/// heading to move that column. Returns true when the layout changed.
+fn column_header(ui: &mut egui::Ui, layout: &mut ColumnLayout) -> bool {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
-    let columns = columns_for(rect, widths);
+    let columns = columns_for(rect, layout);
     let theme = theme::current(ui.ctx());
-    let color = theme.weak_text.0;
-    for (label, column, align) in [
-        ("#", columns.number, egui::Align2::LEFT_CENTER),
-        ("Title", columns.title, egui::Align2::LEFT_CENTER),
-        ("Artist", columns.artist, egui::Align2::LEFT_CENTER),
-        ("Album", columns.album, egui::Align2::LEFT_CENTER),
-        ("Time", columns.time, egui::Align2::RIGHT_CENTER),
-    ] {
-        paint_text(ui, column, label, color, false, align);
-    }
+    let weak = theme.weak_text.0;
+    let accent = theme.accent.0;
     let mut changed = false;
-    for (divider, x) in [
-        (Divider::NumberTitle, columns.number.right()),
-        (Divider::TitleArtist, columns.title.right()),
-        (Divider::ArtistAlbum, columns.artist.right()),
-        (Divider::AlbumTime, columns.album.right()),
-    ] {
+
+    // Headings first, so the dividers registered after them win where they overlap.
+    let mut moving: Option<(usize, usize)> = None;
+    let mut dropped: Option<(usize, usize)> = None;
+    for (index, &(kind, column)) in columns.iter().enumerate() {
+        let id = ui.id().with(("column_heading", kind as u8));
+        let response = ui.interact(column, id, egui::Sense::drag());
+        let pointer_x = response.interact_pointer_pos().map(|pos| pos.x);
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(x) = pointer_x {
+                moving = Some((index, column_gap_at(&columns, x)));
+            }
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if response.drag_stopped() {
+            if let Some(x) = pointer_x {
+                dropped = Some((index, column_gap_at(&columns, x)));
+            }
+        }
+    }
+
+    for (index, &(kind, column)) in columns.iter().enumerate() {
+        let lifted = moving.is_some_and(|(from, _)| from == index);
+        if lifted {
+            ui.painter().rect_filled(column, 2.0, accent.gamma_multiply(0.18));
+        }
+        let color = if lifted { accent } else { weak };
+        paint_text(ui, column, kind.label(), color, false, kind.align());
+    }
+
+    for index in 0..columns.len().saturating_sub(1) {
+        let x = columns[index].1.right();
         let grab = egui::Rect::from_min_max(
             egui::pos2(x - DIVIDER_GRAB, rect.top()),
             egui::pos2(x + DIVIDER_GRAB, rect.bottom()),
         );
-        let id = ui.id().with(("column_divider", divider as u8));
+        // Keyed by the columns on both sides, so a reorder does not inherit a drag.
+        let id = ui
+            .id()
+            .with(("column_divider", columns[index].0 as u8, columns[index + 1].0 as u8));
         let response = ui
             .interact(grab, id, egui::Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::ResizeColumn);
         if response.double_clicked() {
-            widths.reset(divider);
+            layout.reset(index);
             changed = true;
         } else if response.dragged() {
             let dx = response.drag_delta().x;
             if dx != 0.0 {
-                widths.drag(divider, dx, width);
+                layout.drag(index, dx, width);
                 changed = true;
             }
         }
-        let active = response.hovered() || response.dragged();
+        let active = moving.is_none() && (response.hovered() || response.dragged());
         let stroke = if active {
-            egui::Stroke::new(2.0, theme.accent.0)
+            egui::Stroke::new(2.0, accent)
         } else {
             egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
         };
@@ -2720,6 +2843,21 @@ fn column_header(ui: &mut egui::Ui, widths: &mut ColumnWidths) -> bool {
             egui::Rangef::new(rect.top() + inset, rect.bottom() - inset),
             stroke,
         );
+    }
+
+    if let Some((from, gap)) = moving {
+        if gap != from && gap != from + 1 {
+            let x = if gap == 0 {
+                columns[0].1.left()
+            } else {
+                columns[gap - 1].1.right()
+            };
+            ui.painter()
+                .vline(x, egui::Rangef::new(rect.top(), rect.bottom()), egui::Stroke::new(3.0, accent));
+        }
+    }
+    if let Some((from, gap)) = dropped {
+        changed |= layout.move_column(from, gap);
     }
     changed
 }
@@ -3363,65 +3501,152 @@ mod tests {
     #[test]
     fn column_dividers_follow_the_pointer_and_respect_minimums() {
         let width = 800.0;
-        let edges = |w: &ColumnWidths| {
+        let edges = |layout: &ColumnLayout| {
             let mut x = COLUMN_PAD;
-            w.fit(width).map(|column| {
-                x += column;
-                x
-            })
+            layout
+                .fit(width)
+                .into_iter()
+                .map(|column| {
+                    x += column;
+                    x
+                })
+                .collect::<Vec<f32>>()
         };
-        let mut widths = ColumnWidths::default();
-        let before = edges(&widths);
-        widths.drag(Divider::ArtistAlbum, 30.0, width);
-        let after = edges(&widths);
+        let mut layout = ColumnLayout::default();
+        let before = edges(&layout);
+        // Artist | Album
+        layout.drag(2, 30.0, width);
+        let after = edges(&layout);
         assert_eq!(after[2], before[2] + 30.0);
         assert_eq!(after[1], before[1]);
         assert_eq!(after[3], before[3]);
-        widths.drag(Divider::TitleArtist, -50.0, width);
-        assert_eq!(edges(&widths)[1], before[1] - 50.0);
-        assert_eq!(edges(&widths)[2], after[2]);
-        widths.drag(Divider::AlbumTime, 1000.0, width);
-        assert_eq!(widths.time, MIN_TIME);
-        widths.drag(Divider::NumberTitle, -1000.0, width);
-        assert_eq!(widths.number, MIN_NUMBER);
-        widths.drag(Divider::TitleArtist, 5000.0, width);
-        assert!(widths.fit(width)[1] >= MIN_TITLE - 0.01);
-        let total: f32 = widths.fit(width).iter().sum();
+        // Title | Artist
+        layout.drag(1, -50.0, width);
+        assert_eq!(edges(&layout)[1], before[1] - 50.0);
+        assert_eq!(edges(&layout)[2], after[2]);
+        layout.drag(3, 1000.0, width);
+        assert_eq!(layout.time, MIN_TIME);
+        layout.drag(0, -1000.0, width);
+        assert_eq!(layout.number, MIN_NUMBER);
+        layout.drag(1, 5000.0, width);
+        assert!(layout.fit(width)[1] >= MIN_TITLE - 0.01);
+        let total: f32 = layout.fit(width).iter().sum();
         assert!((total - (width - COLUMN_PAD)).abs() < 0.01);
+        layout.reset(2);
+        assert_eq!(layout.artist, default_text_width());
+        assert_eq!(layout.album, default_text_width());
+    }
+
+    #[test]
+    fn dividers_still_follow_the_pointer_after_a_reorder() {
+        let width = 900.0;
+        let mut layout = ColumnLayout::default();
+        // Time, #, Album, Title, Artist
+        layout.order = vec![
+            ColumnKind::Time,
+            ColumnKind::Number,
+            ColumnKind::Album,
+            ColumnKind::Title,
+            ColumnKind::Artist,
+        ];
+        let right_edges = |layout: &ColumnLayout| {
+            let mut x = 0.0;
+            layout
+                .fit(width)
+                .into_iter()
+                .map(|column| {
+                    x += column;
+                    x
+                })
+                .collect::<Vec<f32>>()
+        };
+        let before = right_edges(&layout);
+        for divider in 0..4 {
+            let mut moved = layout.clone();
+            moved.drag(divider, 12.0, width);
+            let after = right_edges(&moved);
+            for (edge, (a, b)) in after.iter().zip(&before).enumerate() {
+                let expected = if edge == divider { b + 12.0 } else { *b };
+                assert!((a - expected).abs() < 0.01, "divider {divider} edge {edge}: {a} vs {expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn dragging_a_heading_moves_that_column() {
+        use ColumnKind::*;
+        let mut layout = ColumnLayout::default();
+        // Dropping beside itself changes nothing.
+        assert!(!layout.move_column(2, 2));
+        assert!(!layout.move_column(2, 3));
+        assert_eq!(layout.order, vec![Number, Title, Artist, Album, Time]);
+        // Time to the front.
+        assert!(layout.move_column(4, 0));
+        assert_eq!(layout.order, vec![Time, Number, Title, Artist, Album]);
+        // Number to the end.
+        assert!(layout.move_column(1, 5));
+        assert_eq!(layout.order, vec![Time, Title, Artist, Album, Number]);
+        // Album right, past Number.
+        assert!(layout.move_column(3, 5));
+        assert_eq!(layout.order, vec![Time, Title, Artist, Number, Album]);
+        assert!(!layout.move_column(9, 0));
+    }
+
+    #[test]
+    fn heading_drop_picks_the_nearest_gap() {
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(808.0, 22.0));
+        let columns = columns_for(rect, &ColumnLayout::default());
+        assert_eq!(column_gap_at(&columns, -50.0), 0);
+        assert_eq!(column_gap_at(&columns, columns[2].1.right() + 3.0), 3);
+        assert_eq!(column_gap_at(&columns, columns[2].1.left() + 2.0), 2);
+        assert_eq!(column_gap_at(&columns, 5000.0), 5);
     }
 
     #[test]
     fn narrow_window_shrinks_artist_and_album_before_title() {
-        let widths = ColumnWidths::default();
-        let fitted = widths.fit(300.0);
+        let layout = ColumnLayout::default();
+        let fitted = layout.fit(300.0);
         assert!((fitted[1] - MIN_TITLE).abs() < 0.01);
-        assert!(fitted[2] < widths.artist);
-        assert_eq!(fitted[0], widths.number);
-        assert_eq!(fitted[4], widths.time);
+        assert!(fitted[2] < layout.artist);
+        assert_eq!(fitted[0], layout.number);
+        assert_eq!(fitted[4], layout.time);
     }
 
     #[test]
     fn column_widths_persist_and_old_settings_get_defaults() {
         let parsed: Settings = serde_json::from_str(r#"{"volume":0.4}"#).unwrap();
-        assert_eq!(parsed.columns, ColumnWidths::default());
+        assert_eq!(parsed.columns, ColumnLayout::default());
         let stored = Settings {
-            columns: ColumnWidths {
+            columns: ColumnLayout {
                 number: 30.0,
                 artist: 120.0,
                 album: 90.0,
                 time: 60.0,
+                order: vec![
+                    ColumnKind::Album,
+                    ColumnKind::Title,
+                    ColumnKind::Time,
+                    ColumnKind::Number,
+                    ColumnKind::Artist,
+                ],
             },
             ..Settings::default()
         };
         let back: Settings = serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
         assert_eq!(back.columns, stored.columns);
-        let bad = ColumnWidths {
+        let bad = ColumnLayout {
             number: f32::NAN,
             artist: 1.0,
-            ..ColumnWidths::default()
+            order: vec![ColumnKind::Title, ColumnKind::Title],
+            ..ColumnLayout::default()
         }
         .sanitized();
         assert_eq!(bad.number, default_number_width());
         assert_eq!(bad.artist, MIN_TEXT);
+        assert_eq!(bad.order, default_column_order());
+        let old: Settings =
+            serde_json::from_str(r#"{"columns":{"number":30,"artist":100,"album":100,"time":60}}"#).unwrap();
+        assert_eq!(old.columns.order, default_column_order());
+        assert_eq!(old.columns.number, 30.0);
     }
 }

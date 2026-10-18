@@ -79,6 +79,7 @@ The LAME `--nogap` bit reservoir is not passed across files. Leave it alone unle
 - Past the threshold, a move draws an accent insertion line, an accent stroke on the picked-up rows, and a foreground label (the title, or `N tracks`).
 - Delete sends `RemoveMany` for every selected index. Removing the current row starts the next remaining playable row. A single `Remove` that empties the playlist does not halt or release the decoder. Leave that unless asked.
 - `MoveRows` keeps playing the same file. It does not restart output. `Reorder` does not update `display_index`. `MoveRows` and `RemoveMany` do.
+- Header dividers resize the columns on both sides. Title takes the leftover width. Double-click a divider to reset it. Dragging a heading moves that column. `settings.json` `columns` stores the widths and `order`.
 - The playlist `ScrollArea` uses `id_salt("playlist")` and `drag_to_scroll(false)`. Row hit testing uses this frame's rectangles because `show_rows` virtualizes. Drive the gesture from the pointer, not from `response.dragged()`.
 
 ## File drop
