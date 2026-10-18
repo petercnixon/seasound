@@ -1,6 +1,7 @@
 //! The SeaSound window. Playback and file parsing live in the other crates.
 
 mod app;
+mod theme;
 
 pub fn run() -> eframe::Result {
     let mut options = eframe::NativeOptions {

@@ -16,19 +16,13 @@ use seasound_model::{
 use seasound_playback::{Command, Engine, Opener, Snapshot, StartAt};
 use serde::{Deserialize, Serialize};
 
+use crate::theme::{self, Theme, Themes};
+
 const ROW_H: f32 = 28.0;
 const DRAG_SLOP: f32 = 8.0;
 const AUDIO_EXT: &[&str] = &[
     "mp3", "flac", "m4a", "m4b", "mp4", "wav", "aiff", "aif", "ogg", "cue", "m3u", "m3u8",
 ];
-
-const BG: egui::Color32 = egui::Color32::from_rgb(0x0e, 0x14, 0x18);
-const PANEL: egui::Color32 = egui::Color32::from_rgb(0x14, 0x1c, 0x22);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(0x20, 0xa8, 0x9c);
-const ERROR: egui::Color32 = egui::Color32::from_rgb(0xd0, 0x78, 0x70);
-// Light fills so the row text can use the window background and stay readable.
-const ROW_SELECTED: egui::Color32 = egui::Color32::from_rgb(0x5d, 0xce, 0xc3);
-const ROW_HOVER: egui::Color32 = egui::Color32::from_rgb(0xa8, 0xdd, 0xd6);
 
 pub struct SeaSoundApp {
     engine: Engine,
@@ -74,6 +68,10 @@ pub struct SeaSoundApp {
     session: Option<SessionPlayback>,
     settings_open: bool,
     columns: ColumnWidths,
+    themes: Themes,
+    themes_dir: Option<PathBuf>,
+    /// Name of the chosen theme. Kept when the file is missing so it comes back on reload.
+    theme_name: String,
 }
 
 /// Replace clears the playlist. Append keeps what is already there.
@@ -200,6 +198,9 @@ struct Settings {
     /// Playlist column widths set by dragging the header.
     #[serde(default)]
     columns: ColumnWidths,
+    /// Theme name. Built-in themes and `*.json` files in `themes/` of the config directory.
+    #[serde(default = "default_theme")]
+    theme: String,
 }
 
 /// The playlist that was in the app at exit, plus the track that was current.
@@ -222,6 +223,10 @@ fn default_auto_save_playlists() -> bool {
     true
 }
 
+fn default_theme() -> String {
+    theme::DEFAULT_THEME.to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -234,6 +239,7 @@ impl Default for Settings {
             auto_save_playlists: default_auto_save_playlists(),
             session: None,
             columns: ColumnWidths::default(),
+            theme: default_theme(),
         }
     }
 }
@@ -250,7 +256,6 @@ enum StartupLoad {
 
 impl SeaSoundApp {
     pub fn new(creation: &eframe::CreationContext<'_>) -> Self {
-        theme(&creation.egui_ctx);
         let config_dir = ProjectDirs::from("audio", "SeaSound", "SeaSound")
             .map(|dirs| dirs.config_dir().to_path_buf());
         if let Some(dir) = &config_dir {
@@ -262,6 +267,12 @@ impl SeaSoundApp {
             .map(|path| load_settings(path))
             .unwrap_or_default();
         let volume = settings.volume.clamp(0.0, 1.0);
+        let themes_dir = config_dir.as_ref().map(|dir| dir.join("themes"));
+        if let Some(dir) = &themes_dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let themes = Themes::load(themes_dir.as_deref());
+        theme::apply(&creation.egui_ctx, themes.get(&settings.theme));
         let plugin_dir = config_dir.as_ref().map(|dir| dir.join("plugins"));
         if let Some(dir) = &plugin_dir {
             let _ = std::fs::create_dir_all(dir);
@@ -311,6 +322,9 @@ impl SeaSoundApp {
             session: settings.session.clone(),
             settings_open: false,
             columns: settings.columns.sanitized(),
+            themes,
+            themes_dir,
+            theme_name: settings.theme.clone(),
         };
         match startup_load(settings.resume_playback, settings.session, settings.playlist) {
             StartupLoad::Session(session) => {
@@ -784,7 +798,7 @@ impl SeaSoundApp {
                             } else {
                                 plugin.name.as_str()
                             };
-                            ui.colored_label(ERROR, format!("{name} — {error}"));
+                            ui.colored_label(ui.visuals().error_fg_color, format!("{name} — {error}"));
                             continue;
                         }
                         let mut on = plugin.enabled;
@@ -816,9 +830,47 @@ impl SeaSoundApp {
                         self.settings_open = true;
                         ui.close_menu();
                     }
+                    ui.menu_button("Theme", |ui| self.theme_menu(ui));
                 });
             });
         });
+    }
+
+    fn theme_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(220.0);
+        let current = self.themes.get(&self.theme_name).name.clone();
+        let mut chosen = None;
+        for theme in &self.themes.list {
+            if ui.radio(theme.name == current, theme.name.as_str()).clicked() {
+                chosen = Some(theme.name.clone());
+            }
+        }
+        ui.separator();
+        if ui
+            .button("Reload themes")
+            .on_hover_text("Read the theme files again")
+            .clicked()
+        {
+            self.themes = Themes::load(self.themes_dir.as_deref());
+            chosen = Some(self.theme_name.clone());
+        }
+        if let Some(dir) = &self.themes_dir {
+            ui.label(
+                egui::RichText::new(format!("Add *.json themes to {}", dir.display()))
+                    .size(12.0)
+                    .color(theme::current(ui.ctx()).weak_text.0),
+            );
+        }
+        for error in &self.themes.errors {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        if let Some(name) = chosen {
+            theme::apply(ui.ctx(), self.themes.get(&name));
+            if name != self.theme_name {
+                self.theme_name = name;
+                self.write_settings();
+            }
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -864,7 +916,7 @@ impl SeaSoundApp {
                         "When this is on, SeaSound writes the open playlist before you open another one, open files or a folder, start a new playlist, or quit. A new playlist that has never been saved is still written to the app playlist when you quit.",
                     )
                     .size(13.0)
-                    .color(ui.visuals().weak_text_color()),
+                    .color(theme::current(ui.ctx()).weak_text.0),
                 );
                 ui.add_space(14.0);
                 if ui.button("Close").clicked() {
@@ -940,12 +992,13 @@ impl SeaSoundApp {
                             self.engine.command(Command::Stop);
                         }
                         ui.add_space(8.0);
-                        let repeat = colored(snap.repeat.label(), snap.repeat != Repeat::Off);
+                        let repeat = colored(ui, snap.repeat.label(), snap.repeat != Repeat::Off);
                         if ui.button(repeat).clicked() {
                             self.engine.command(Command::SetRepeat(snap.repeat.next()));
                             self.settle = 10;
                         }
                         let shuffle = colored(
+                            ui,
                             if snap.shuffle { "Shuffle on" } else { "Shuffle" },
                             snap.shuffle,
                         );
@@ -980,7 +1033,7 @@ impl SeaSoundApp {
                     });
                     ui.horizontal(|ui| {
                         let mute = if self.muted { "Muted" } else { "Volume" };
-                        if ui.button(colored(mute, self.muted)).clicked() {
+                        if ui.button(colored(ui, mute, self.muted)).clicked() {
                             self.muted = !self.muted;
                             self.engine.command(Command::SetMuted(self.muted));
                         }
@@ -1028,11 +1081,12 @@ impl SeaSoundApp {
             return;
         }
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_rgb(0x0a, 0x10, 0x14));
+        let theme = theme::current(ui.ctx());
+        ui.painter().rect_filled(rect, 4.0, theme.inset.0);
         ui.painter().rect_stroke(
             rect.shrink(10.0),
             2.0,
-            egui::Stroke::new(2.0, ACCENT),
+            egui::Stroke::new(2.0, theme.accent.0),
             egui::StrokeKind::Inside,
         );
     }
@@ -1070,10 +1124,11 @@ impl SeaSoundApp {
         } else {
             parts.join("  ·  ")
         };
+        let theme = theme::current(ui.ctx());
         let color = if snap.error.is_some() || self.notice.is_some() {
-            ERROR
+            theme.error.0
         } else {
-            ui.visuals().weak_text_color()
+            theme.weak_text.0
         };
         ui.label(egui::RichText::new(text).color(color).size(12.0));
     }
@@ -1115,12 +1170,12 @@ impl SeaSoundApp {
                 return;
             }
             if hovering {
-                ui.label(egui::RichText::new("Drop audio to add it").color(ACCENT));
+                ui.label(egui::RichText::new("Drop audio to add it").color(ui.visuals().selection.bg_fill));
             }
             if self.loading {
                 ui.label(
                     egui::RichText::new(loading_label(self.load_progress))
-                        .color(ACCENT)
+                        .color(ui.visuals().selection.bg_fill)
                         .size(14.0),
                 );
             }
@@ -1315,14 +1370,15 @@ impl SeaSoundApp {
         bar_inset: f32,
     ) {
         let rect = slot.rect;
+        let theme = theme::current(ui.ctx());
         match &slot.line {
             Line::Header(title) => {
-                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(0x10, 0x18, 0x1e));
+                ui.painter().rect_filled(rect, 0.0, theme.group_header.0);
                 paint_text(
                     ui,
                     rect.shrink2(egui::vec2(10.0, 0.0)),
                     title,
-                    ACCENT,
+                    theme.group_header_text.0,
                     true,
                     egui::Align2::LEFT_CENTER,
                 );
@@ -1336,27 +1392,27 @@ impl SeaSoundApp {
                 let moving = self.row_drag.is_some_and(|drag| {
                     drag.travel > DRAG_SLOP && matches!(drag.gesture, RowGesture::Move { .. })
                 });
-                let fill = row_highlight(playing, selected, pointer_on_row(slot, bar_inset));
-                if let Some(fill) = fill {
+                let highlight = row_highlight(&theme, playing, selected, pointer_on_row(slot, bar_inset));
+                if let Some((fill, _)) = highlight {
                     ui.painter().rect_filled(rect, 0.0, fill);
                 }
                 if playing {
                     let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 3.0, rect.bottom()));
-                    ui.painter().rect_filled(bar, 0.0, BG);
+                    ui.painter().rect_filled(bar, 0.0, theme.background.0);
                 }
                 if moving && selected {
                     ui.painter().rect_stroke(
                         rect,
                         0.0,
-                        egui::Stroke::new(1.0, BG),
+                        egui::Stroke::new(1.0, theme.background.0),
                         egui::StrokeKind::Inside,
                     );
                 }
                 let columns = columns_for(rect, &self.columns);
-                let color = if fill.is_some() {
-                    BG
+                let color = if let Some((_, text)) = highlight {
+                    text
                 } else if row.error.is_some() {
-                    ERROR
+                    theme.error.0
                 } else {
                     ui.visuals().text_color()
                 };
@@ -1404,7 +1460,8 @@ impl SeaSoundApp {
         let Some(slot) = slots.first() else {
             return;
         };
-        paint_insertion_line(ui.painter(), slot.rect.left(), slot.rect.right(), y);
+        let accent = ui.visuals().selection.bg_fill;
+        paint_insertion_line(ui.painter(), accent, slot.rect.left(), slot.rect.right(), y);
     }
 
     fn autoscroll<R>(&self, ctx: &egui::Context, output: &egui::containers::scroll_area::ScrollAreaOutput<R>) {
@@ -1599,6 +1656,7 @@ impl SeaSoundApp {
                 None
             },
             columns: self.columns,
+            theme: self.theme_name.clone(),
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2195,40 +2253,46 @@ fn ghost_text(rows: &[RowView], selected: &HashSet<usize>) -> String {
     }
 }
 
-fn paint_insertion_line(painter: &egui::Painter, left: f32, right: f32, y: f32) {
+fn paint_insertion_line(painter: &egui::Painter, accent: egui::Color32, left: f32, right: f32, y: f32) {
     let line = egui::Rect::from_min_max(egui::pos2(left, y - 1.0), egui::pos2(right, y + 1.0));
-    painter.rect_filled(line, 0.0, ACCENT);
+    painter.rect_filled(line, 0.0, accent);
     let nub = egui::Rect::from_min_max(egui::pos2(left, y - 5.0), egui::pos2(left + 8.0, y + 5.0));
-    painter.rect_filled(nub, 2.0, ACCENT);
+    painter.rect_filled(nub, 2.0, accent);
 }
 
 fn paint_ghost(ctx: &egui::Context, pointer: egui::Pos2, label: &str) {
     let layer = egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("playlist-drag-ghost"));
     let painter = ctx.layer_painter(layer);
     let font = egui::TextStyle::Body.resolve(ctx.style().as_ref());
-    let galley = painter.layout_no_wrap(label.to_owned(), font, egui::Color32::WHITE);
+    let theme = theme::current(ctx);
+    let text = theme.control_text_hover.0;
+    let galley = painter.layout_no_wrap(label.to_owned(), font, text);
     let pad = egui::vec2(10.0, 6.0);
     let origin = pointer + egui::vec2(14.0, 16.0);
     let rect = egui::Rect::from_min_size(origin, galley.size() + pad * 2.0);
-    painter.rect_filled(
-        rect,
-        4.0,
-        egui::Color32::from_rgba_unmultiplied(0x14, 0x1c, 0x22, 235),
-    );
-    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
-    painter.galley(rect.min + pad, galley, egui::Color32::WHITE);
+    let [r, g, b, _] = theme.panel.0.to_array();
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(r, g, b, 235));
+    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, theme.accent.0), egui::StrokeKind::Inside);
+    painter.galley(rect.min + pad, galley, text);
 }
 
-fn row_highlight(playing: bool, selected: bool, hovered: bool) -> Option<egui::Color32> {
-    if playing {
-        Some(ACCENT)
+/// Row fill and the text colour drawn on it.
+fn row_highlight(
+    theme: &Theme,
+    playing: bool,
+    selected: bool,
+    hovered: bool,
+) -> Option<(egui::Color32, egui::Color32)> {
+    let (fill, text) = if playing {
+        (theme.accent, theme.accent_text)
     } else if selected {
-        Some(ROW_SELECTED)
+        (theme.row_selected, theme.row_selected_text)
     } else if hovered {
-        Some(ROW_HOVER)
+        (theme.row_hover, theme.row_hover_text)
     } else {
-        None
-    }
+        return None;
+    };
+    Some((fill.0, text.0))
 }
 
 fn playlist_lines(rows: &[RowView]) -> Vec<Line> {
@@ -2318,7 +2382,7 @@ fn playlist_playtime(rows: &[RowView]) -> String {
 }
 
 fn detail_line(ui: &mut egui::Ui, label: &str, value: &str) {
-    let weak = ui.visuals().weak_text_color();
+    let weak = theme::current(ui.ctx()).weak_text.0;
     ui.label(egui::RichText::new(label).color(weak).size(13.0));
     let value_color = if value == "—" { weak } else { ui.visuals().text_color() };
     ui.label(egui::RichText::new(value).color(value_color).size(13.0));
@@ -2428,10 +2492,10 @@ fn play_word(state: PlayState) -> &'static str {
     }
 }
 
-fn colored(text: &str, active: bool) -> egui::RichText {
+fn colored(ui: &egui::Ui, text: &str, active: bool) -> egui::RichText {
     let text = egui::RichText::new(text);
     if active {
-        text.color(ACCENT)
+        text.color(ui.visuals().selection.bg_fill)
     } else {
         text
     }
@@ -2441,25 +2505,6 @@ fn consume(ctx: &egui::Context, key: egui::Key) -> bool {
     ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key))
 }
 
-fn theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = BG;
-    visuals.panel_fill = PANEL;
-    visuals.faint_bg_color = BG;
-    visuals.extreme_bg_color = egui::Color32::from_rgb(0x0a, 0x10, 0x14);
-    visuals.code_bg_color = PANEL;
-    visuals.selection.bg_fill = ACCENT;
-    visuals.selection.stroke.color = ACCENT;
-    visuals.hyperlink_color = ACCENT;
-    visuals.widgets.noninteractive.bg_fill = PANEL;
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x2a, 0x38, 0x42);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x34, 0x46, 0x50);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x1a, 0x6e, 0x66);
-    let mut style = (*ctx.style()).clone();
-    style.visuals = visuals;
-    style.spacing.slider_rail_height = 6.0;
-    ctx.set_style(style);
-}
 
 struct Columns {
     number: egui::Rect,
@@ -2627,7 +2672,8 @@ fn column_header(ui: &mut egui::Ui, widths: &mut ColumnWidths) -> bool {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
     let columns = columns_for(rect, widths);
-    let color = ui.visuals().weak_text_color();
+    let theme = theme::current(ui.ctx());
+    let color = theme.weak_text.0;
     for (label, column, align) in [
         ("#", columns.number, egui::Align2::LEFT_CENTER),
         ("Title", columns.title, egui::Align2::LEFT_CENTER),
@@ -2664,7 +2710,7 @@ fn column_header(ui: &mut egui::Ui, widths: &mut ColumnWidths) -> bool {
         }
         let active = response.hovered() || response.dragged();
         let stroke = if active {
-            egui::Stroke::new(2.0, ACCENT)
+            egui::Stroke::new(2.0, theme.accent.0)
         } else {
             egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
         };
@@ -2783,10 +2829,16 @@ mod tests {
 
     #[test]
     fn highlighted_rows_keep_a_light_fill() {
-        assert_eq!(row_highlight(true, true, true), Some(ACCENT));
-        assert_eq!(row_highlight(false, true, true), Some(ROW_SELECTED));
-        assert_eq!(row_highlight(false, false, true), Some(ROW_HOVER));
-        assert_eq!(row_highlight(false, false, false), None);
+        let themes = Themes::load(None);
+        let theme = themes.get(theme::DEFAULT_THEME);
+        let pair = |fill: theme::Hex, text: theme::Hex| Some((fill.0, text.0));
+        assert_eq!(row_highlight(theme, true, true, true), pair(theme.accent, theme.accent_text));
+        assert_eq!(
+            row_highlight(theme, false, true, true),
+            pair(theme.row_selected, theme.row_selected_text)
+        );
+        assert_eq!(row_highlight(theme, false, false, true), pair(theme.row_hover, theme.row_hover_text));
+        assert_eq!(row_highlight(theme, false, false, false), None);
     }
 
     #[test]
