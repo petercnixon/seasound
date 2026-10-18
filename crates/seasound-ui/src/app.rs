@@ -37,6 +37,9 @@ pub struct SeaSoundApp {
     muted: bool,
     seek: f32,
     seek_drag: bool,
+    /// The seek command is in flight. Keep the bar where the user left it until the
+    /// snapshot catches up, including while playback stays paused.
+    seek_sent: bool,
     selected: HashSet<usize>,
     row_drag: Option<RowDrag>,
     covers: HashMap<SourceId, Cover>,
@@ -63,7 +66,11 @@ pub struct SeaSoundApp {
     plugins: Vec<seasound_media::PluginStatus>,
     disabled_plugins: Vec<String>,
     /// Remember the in-app playlist, track, and position across launches.
+    /// Also starts an opened playlist file from its saved place.
     resume_playback: bool,
+    /// Write the open playlist file when leaving it, and again on quit.
+    /// A playlist that has never been saved is still written on quit.
+    auto_save_playlists: bool,
     session: Option<SessionPlayback>,
     settings_open: bool,
     columns: ColumnWidths,
@@ -181,8 +188,12 @@ struct Settings {
     #[serde(default)]
     disabled_plugins: Vec<String>,
     /// Play the saved in-app playlist from the saved position on the next launch.
+    /// Opening a playlist file uses the same switch.
     #[serde(default = "default_resume_playback")]
     resume_playback: bool,
+    /// Write an open playlist file before leaving it, and again on quit.
+    #[serde(default = "default_auto_save_playlists")]
+    auto_save_playlists: bool,
     /// Playlist, track, and position saved from the app. Absent when resume is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<SessionPlayback>,
@@ -207,6 +218,10 @@ fn default_resume_playback() -> bool {
     true
 }
 
+fn default_auto_save_playlists() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -216,6 +231,7 @@ impl Default for Settings {
             playlist: None,
             disabled_plugins: Vec::new(),
             resume_playback: default_resume_playback(),
+            auto_save_playlists: default_auto_save_playlists(),
             session: None,
             columns: ColumnWidths::default(),
         }
@@ -266,6 +282,7 @@ impl SeaSoundApp {
             muted: settings.muted,
             seek: 0.0,
             seek_drag: false,
+            seek_sent: false,
             selected: HashSet::new(),
             row_drag: None,
             covers: HashMap::new(),
@@ -290,6 +307,7 @@ impl SeaSoundApp {
             plugins,
             disabled_plugins: settings.disabled_plugins,
             resume_playback: settings.resume_playback,
+            auto_save_playlists: settings.auto_save_playlists,
             session: settings.session.clone(),
             settings_open: false,
             columns: settings.columns.sanitized(),
@@ -328,6 +346,7 @@ impl SeaSoundApp {
             self.forget_selection();
             self.seek = 0.0;
             self.seek_drag = false;
+            self.seek_sent = false;
             self.last_followed = None;
         }
         let (tx, rx) = mpsc::channel();
@@ -475,6 +494,7 @@ impl SeaSoundApp {
         self.forget_selection();
         self.seek = 0.0;
         self.seek_drag = false;
+        self.seek_sent = false;
         self.last_followed = None;
         self.notice = None;
         self.settle = 15;
@@ -509,6 +529,7 @@ impl SeaSoundApp {
         self.forget_selection();
         self.seek = 0.0;
         self.seek_drag = false;
+        self.seek_sent = false;
         self.last_followed = None;
         if let Some(path) = path {
             self.playlist_path = Some(path);
@@ -591,6 +612,7 @@ impl SeaSoundApp {
         let fraction = ((position + seconds) / length).clamp(0.0, 0.999) as f32;
         self.seek = fraction;
         self.seek_drag = false;
+        self.seek_sent = true;
         self.engine.command(Command::SeekFraction(fraction));
         self.settle = 15;
     }
@@ -825,7 +847,21 @@ impl SeaSoundApp {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "On exit, SeaSound saves the playlist in the app, the current track, and the position. The next launch plays that track from the saved position. This is the playlist in the window, not a playlist file you opened. Save playlist stores that same place in the file. Open playlist plays the file from there.",
+                        "On exit, SeaSound saves the playlist in the app, the current track, and the position. The next launch plays that track from the saved position. This is the playlist in the window, not a playlist file you opened. Save playlist stores that same place in the file. Open playlist plays the file from there when this is on.",
+                    )
+                    .size(13.0)
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(12.0);
+                let mut auto_save = self.auto_save_playlists;
+                if ui.checkbox(&mut auto_save, "Auto save playlists").changed() {
+                    self.auto_save_playlists = auto_save;
+                    self.write_settings();
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "When this is on, SeaSound writes the open playlist before you open another one, open files or a folder, start a new playlist, or quit. A new playlist that has never been saved is still written to the app playlist when you quit.",
                     )
                     .size(13.0)
                     .color(ui.visuals().weak_text_color()),
@@ -842,12 +878,16 @@ impl SeaSoundApp {
 
     fn transport(&mut self, ctx: &egui::Context) {
         let snap = self.snap.clone();
-        if !self.seek_drag {
-            self.seek = if snap.segment_frames > 0 {
-                (snap.position_frames as f32 / snap.segment_frames as f32).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
+        let shown = if snap.segment_frames > 0 {
+            (snap.position_frames as f32 / snap.segment_frames as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if self.seek_sent && ((shown - self.seek).abs() < 0.015 || self.settle == 0) {
+            self.seek_sent = false;
+        }
+        if !self.seek_drag && !self.seek_sent {
+            self.seek = shown;
         }
         let row = current_row(&snap).cloned();
         let source_id = row.as_ref().map(|row| row.source_id);
@@ -932,7 +972,9 @@ impl SeaSoundApp {
                         }
                         if response.drag_stopped() || response.clicked() {
                             self.seek_drag = false;
+                            self.seek_sent = true;
                             self.engine.command(Command::SeekFraction(self.seek));
+                            self.settle = 20;
                         }
                         ui.label(end);
                     });
@@ -1486,7 +1528,7 @@ impl SeaSoundApp {
                     self.flush_open_playlist();
                     self.spawn(LoadWork::SavedFile {
                         path,
-                        restore_position: true,
+                        restore_position: self.resume_playback,
                     });
                 }
             }
@@ -1550,6 +1592,7 @@ impl SeaSoundApp {
             playlist: self.playlist_path.clone(),
             disabled_plugins: self.disabled_plugins.clone(),
             resume_playback: self.resume_playback,
+            auto_save_playlists: self.auto_save_playlists,
             session: if self.resume_playback {
                 self.session.clone()
             } else {
@@ -1569,14 +1612,12 @@ impl SeaSoundApp {
         if !self.seen_rows || self.loading {
             return;
         }
-        let path = match self.playlist_path.clone() {
-            Some(path) => path,
-            None => {
-                let Some(dir) = &self.config_dir else {
-                    return;
-                };
-                dir.join("playlist.json")
-            }
+        let Some(path) = quit_playlist_path(
+            self.auto_save_playlists,
+            self.playlist_path.as_deref(),
+            self.config_dir.as_deref(),
+        ) else {
+            return;
         };
         let before = self.playlist_path.clone();
         self.write_playlist_file(&path);
@@ -1601,12 +1642,33 @@ impl SeaSoundApp {
     }
 
     /// Write the attached playlist file before leaving it, so its playhead stays put.
+    /// Skipped when auto-save is off. A playlist with no file is left for quit.
     fn flush_open_playlist(&mut self) {
+        if !self.auto_save_playlists {
+            return;
+        }
         let Some(path) = self.playlist_path.clone() else {
             return;
         };
         self.write_playlist_file(&path);
     }
+}
+
+/// Where quit writes the playlist.
+/// An open file is written only when auto-save is on.
+/// A playlist that was never saved still goes to `playlist.json`.
+fn quit_playlist_path(
+    auto_save: bool,
+    open: Option<&Path>,
+    config_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = open {
+        if auto_save {
+            return Some(path.to_path_buf());
+        }
+        return None;
+    }
+    config_dir.map(|dir| dir.join("playlist.json"))
 }
 
 impl eframe::App for SeaSoundApp {
@@ -3186,6 +3248,7 @@ mod tests {
     fn settings_roundtrip_keeps_resume_and_old_files_default_it_on() {
         let parsed: Settings = serde_json::from_str(r#"{"volume":0.4,"muted":true}"#).unwrap();
         assert!(parsed.resume_playback);
+        assert!(parsed.auto_save_playlists);
         assert!(parsed.session.is_none());
         assert!((parsed.volume - 0.4).abs() < f32::EPSILON);
         let session = SessionPlayback {
@@ -3219,6 +3282,30 @@ mod tests {
         assert!(!off_json.contains("session"));
         let off_back: Settings = serde_json::from_str(&off_json).unwrap();
         assert!(!off_back.resume_playback);
+        assert!(off_back.auto_save_playlists);
+        let manual = Settings {
+            auto_save_playlists: false,
+            ..Settings::default()
+        };
+        let manual_back: Settings =
+            serde_json::from_str(&serde_json::to_string(&manual).unwrap()).unwrap();
+        assert!(!manual_back.auto_save_playlists);
+        let dir = PathBuf::from("/tmp/seasound-config");
+        let open = PathBuf::from("/music/album.json");
+        assert_eq!(
+            quit_playlist_path(true, Some(&open), Some(&dir)),
+            Some(open.clone())
+        );
+        assert_eq!(quit_playlist_path(false, Some(&open), Some(&dir)), None);
+        assert_eq!(
+            quit_playlist_path(false, None, Some(&dir)),
+            Some(dir.join("playlist.json"))
+        );
+        assert_eq!(
+            quit_playlist_path(true, None, Some(&dir)),
+            Some(dir.join("playlist.json"))
+        );
+        assert_eq!(quit_playlist_path(false, None, None), None);
     }
 
     #[test]

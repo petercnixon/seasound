@@ -631,19 +631,28 @@ impl Deck {
     }
 
     fn seek_fraction(&mut self, index: usize, fraction: f32, output: &mut dyn AudioOut) {
+        // A seek while paused moves the playhead and stays paused. Resume and a
+        // stopped seek still start playback: both arrive here from Stopped.
+        let stay_paused = self.state == PlayState::Paused;
         self.cursor.set_index(Some(index));
         self.display_index = Some(index);
-        self.state = PlayState::Playing;
-        output.set_paused(false);
         output.clear();
         self.core.discard_output();
         self.core.force_seek();
         self.spans.clear();
         self.queued = 0;
         self.origin = output.played();
+        if stay_paused {
+            self.state = PlayState::Paused;
+            output.set_paused(true);
+        } else {
+            self.state = PlayState::Playing;
+            output.set_paused(false);
+        }
         // The fraction shifts the segment job. Leave it set until a fill has a decoder.
         // A same-file cue prefetch makes the first open come back later; taking the
-        // frame on that attempt would start at the cue point.
+        // frame on that attempt would start at the cue point. A paused seek waits
+        // the same way until Play, so the frame is still here when playback resumes.
         self.seek_frame = Some(self.frame_for(index, fraction));
     }
 
@@ -1015,6 +1024,24 @@ impl Deck {
         ))
     }
 
+    /// The place a paused seek is waiting to play. Fill has not run, so the
+    /// decoder clock is still the old frame.
+    fn paused_seek_place(&self) -> Option<(usize, u64, u64, u32)> {
+        if self.state != PlayState::Paused {
+            return None;
+        }
+        let frame = self.seek_frame?;
+        let index = self.display_index.or_else(|| self.cursor.index())?;
+        let segment = self.segment(index)?;
+        let entry = self.playlist.entries.get(index)?;
+        let source = self.playlist.source(entry.source_id)?;
+        let frames = segment.frames();
+        let position = frame
+            .saturating_sub(segment.start_frame)
+            .min(frames.saturating_sub(1));
+        Some((index, position, frames, source.sample_rate.max(1)))
+    }
+
     /// Decoder position, pulled back by the audio still sitting in the output ring.
     fn heard_from_decoder(&self) -> Option<(usize, u64, u64, u32)> {
         let index = self.display_index.or_else(|| self.cursor.index())?;
@@ -1037,7 +1064,13 @@ impl Deck {
 }
 
 fn publish(deck: &Deck, output: &dyn AudioOut, published: &Mutex<Snapshot>) {
-    let located = deck.locate().or_else(|| deck.heard_from_decoder());
+    // While paused, the decoder has not taken the seek yet. Report that frame so
+    // the bar stays where it was moved. Playing, including a resumed start, keeps
+    // the device clock.
+    let located = deck
+        .paused_seek_place()
+        .or_else(|| deck.locate())
+        .or_else(|| deck.heard_from_decoder());
     let index = located
         .map(|(index, _, _, _)| index)
         .or(deck.display_index)
@@ -1822,6 +1855,139 @@ mod tests {
         fn set_device(&mut self, _name: Option<&str>) -> Result<(), Error> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_seek_while_paused_stays_paused_and_plays_from_there() {
+        let frames = 44_100 * 10;
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let opener: Opener = Arc::new(|source| {
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let engine = Engine::start_with(opener, Box::new(memory));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("long.flac", frames)]),
+            autoplay: true,
+            start: None,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot.state == PlayState::Playing && snapshot.position_frames > 1_000 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "playback did not start: {:?} {}",
+                    snapshot.state,
+                    snapshot.error.unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        engine.command(Command::TogglePause);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if engine.snapshot().state == PlayState::Paused {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("pause did not land: {:?}", engine.snapshot().state);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let heard = recorded.lock().unwrap().len();
+        engine.command(Command::SeekFraction(0.5));
+        let target = (frames as f64 * 0.5) as u64;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let near = (snapshot.position_frames as i64 - target as i64).abs() < 2_000;
+            if snapshot.state == PlayState::Paused && near {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "paused seek moved playback: {:?} position {} target {target}",
+                    snapshot.state, snapshot.position_frames
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(120));
+        assert_eq!(engine.snapshot().state, PlayState::Paused);
+        assert_eq!(recorded.lock().unwrap().len(), heard);
+        engine.command(Command::TogglePause);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let samples = recorded.lock().unwrap().len();
+            if engine.snapshot().state == PlayState::Playing && samples > heard + 4 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "play did not continue from the seek: {:?} samples {} heard {heard}",
+                    engine.snapshot().state,
+                    recorded.lock().unwrap().len()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let guard = recorded.lock().unwrap();
+        let first_new = guard[heard];
+        assert!(
+            (first_new - target as f32).abs() < 4_000.0,
+            "resumed at {first_new}, expected about {target}"
+        );
+    }
+
+    #[test]
+    fn a_saved_start_plays_from_the_middle() {
+        let frames = 44_100 * 10;
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let opener: Opener = Arc::new(|source| {
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let engine = Engine::start_with(opener, Box::new(memory));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("long.flac", frames)]),
+            autoplay: false,
+            start: Some(StartAt {
+                index: 0,
+                fraction: 0.25,
+            }),
+        });
+        let target = (frames as f64 * 0.25) as f32;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let ready = recorded.lock().unwrap().len() >= 2;
+            if ready {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                let snapshot = engine.snapshot();
+                panic!(
+                    "saved start produced no audio: {:?} {}",
+                    snapshot.state,
+                    snapshot.error.unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(engine.snapshot().state, PlayState::Playing);
+        let first = recorded.lock().unwrap()[0];
+        assert!(
+            (first - target).abs() < 4_000.0,
+            "started at {first}, expected about {target}"
+        );
     }
 
     #[test]
