@@ -757,30 +757,6 @@ impl SeaSoundApp {
                         ui.close_menu();
                     }
                 });
-                ui.menu_button("Audio", |ui| {
-                    let devices = self.snap.devices.clone();
-                    let current = self.snap.device.clone();
-                    if ui.button("System default").clicked() {
-                        self.device_pref = None;
-                        self.engine.command(Command::SetDevice(None));
-                        ui.close_menu();
-                    }
-                    for name in devices.iter() {
-                        let selected = name == &current;
-                        if ui.selectable_label(selected, name).clicked() {
-                            self.device_pref = Some(name.clone());
-                            self.engine.command(Command::SetDevice(Some(name.clone())));
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                    let mute = if self.muted { "Unmute" } else { "Mute" };
-                    if ui.button(mute).clicked() {
-                        self.muted = !self.muted;
-                        self.engine.command(Command::SetMuted(self.muted));
-                        ui.close_menu();
-                    }
-                });
                 ui.menu_button("Plugins", |ui| {
                     ui.set_min_width(280.0);
                     ui.label("Plugins run with the same permissions as SeaSound.");
@@ -918,6 +894,15 @@ impl SeaSoundApp {
                     .size(13.0)
                     .color(theme::current(ui.ctx()).weak_text.0),
                 );
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Output device").strong());
+                ui.add_space(6.0);
+                // A machine can list dozens of outputs, so the list scrolls instead of running off the window.
+                egui::ScrollArea::vertical()
+                    .id_salt("output_devices")
+                    .max_height(220.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| self.device_list(ui));
                 ui.add_space(14.0);
                 if ui.button("Close").clicked() {
                     self.settings_open = false;
@@ -925,6 +910,22 @@ impl SeaSoundApp {
             });
         if shown.should_close() {
             self.settings_open = false;
+        }
+    }
+
+    fn device_list(&mut self, ui: &mut egui::Ui) {
+        let devices = self.snap.devices.clone();
+        let current = self.snap.device.clone();
+        if ui.selectable_label(self.device_pref.is_none(), "System default").clicked() {
+            self.device_pref = None;
+            self.engine.command(Command::SetDevice(None));
+        }
+        for name in devices.iter() {
+            let selected = self.device_pref.is_some() && name == &current;
+            if ui.selectable_label(selected, name).clicked() {
+                self.device_pref = Some(name.clone());
+                self.engine.command(Command::SetDevice(Some(name.clone())));
+            }
         }
     }
 
@@ -2083,6 +2084,10 @@ fn hit_track(
     bar_inset: f32,
 ) -> Option<(usize, usize)> {
     for slot in slots {
+        // A menu above the list, or a panel over a row cut off by the viewport, owns the pointer.
+        if !slot.response.contains_pointer() {
+            continue;
+        }
         if !row_hit_rect(slot.rect, bar_inset).contains(pos) {
             continue;
         }
