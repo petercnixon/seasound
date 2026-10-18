@@ -1435,7 +1435,7 @@ impl SeaSoundApp {
                         ColumnKind::Album => (row.album.as_str(), false),
                         ColumnKind::Time => (time.as_str(), false),
                     };
-                    paint_text(ui, column, text, color, strong, kind.align());
+                    paint_text(ui, column, text, color, strong, egui::Align2::LEFT_CENTER);
                 }
                 if let Some(error) = &row.error {
                     slot.response.clone().on_hover_text(error.as_str());
@@ -2550,13 +2550,6 @@ impl ColumnKind {
         }
     }
 
-    fn align(self) -> egui::Align2 {
-        match self {
-            ColumnKind::Time => egui::Align2::RIGHT_CENTER,
-            _ => egui::Align2::LEFT_CENTER,
-        }
-    }
-
     fn min_width(self) -> f32 {
         match self {
             ColumnKind::Number => MIN_NUMBER,
@@ -2805,7 +2798,7 @@ fn column_header(ui: &mut egui::Ui, layout: &mut ColumnLayout) -> bool {
             ui.painter().rect_filled(column, 2.0, accent.gamma_multiply(0.18));
         }
         let color = if lifted { accent } else { weak };
-        paint_text(ui, column, kind.label(), color, false, kind.align());
+        paint_text(ui, column, kind.label(), color, false, egui::Align2::LEFT_CENTER);
     }
 
     for index in 0..columns.len().saturating_sub(1) {
