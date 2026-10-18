@@ -66,6 +66,7 @@ pub struct SeaSoundApp {
     resume_playback: bool,
     session: Option<SessionPlayback>,
     settings_open: bool,
+    columns: ColumnWidths,
 }
 
 /// Replace clears the playlist. Append keeps what is already there.
@@ -185,6 +186,9 @@ struct Settings {
     /// Playlist, track, and position saved from the app. Absent when resume is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<SessionPlayback>,
+    /// Playlist column widths set by dragging the header.
+    #[serde(default)]
+    columns: ColumnWidths,
 }
 
 /// The playlist that was in the app at exit, plus the track that was current.
@@ -213,6 +217,7 @@ impl Default for Settings {
             disabled_plugins: Vec::new(),
             resume_playback: default_resume_playback(),
             session: None,
+            columns: ColumnWidths::default(),
         }
     }
 }
@@ -287,6 +292,7 @@ impl SeaSoundApp {
             resume_playback: settings.resume_playback,
             session: settings.session.clone(),
             settings_open: false,
+            columns: settings.columns.sanitized(),
         };
         match startup_load(settings.resume_playback, settings.session, settings.playlist) {
             StartupLoad::Session(session) => {
@@ -1076,7 +1082,9 @@ impl SeaSoundApp {
                         .size(14.0),
                 );
             }
-            column_header(ui);
+            if column_header(ui, &mut self.columns) {
+                ui.ctx().request_repaint();
+            }
             ui.separator();
             ui.spacing_mut().item_spacing.y = 0.0;
             let lines = playlist_lines(&rows);
@@ -1302,7 +1310,7 @@ impl SeaSoundApp {
                         egui::StrokeKind::Inside,
                     );
                 }
-                let columns = columns_for(rect);
+                let columns = columns_for(rect, &self.columns);
                 let color = if fill.is_some() {
                     BG
                 } else if row.error.is_some() {
@@ -1547,6 +1555,7 @@ impl SeaSoundApp {
             } else {
                 None
             },
+            columns: self.columns,
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2398,38 +2407,164 @@ struct Columns {
     time: egui::Rect,
 }
 
-fn columns_for(rect: egui::Rect) -> Columns {
-    let number = 44.0;
-    let time = 72.0;
-    let rest = (rect.width() - number - time - 8.0).max(90.0);
-    let artist = rest * 0.26;
-    let album = rest * 0.26;
-    let title = rest - artist - album;
-    let y0 = rect.top();
-    let y1 = rect.bottom();
-    let mut x = rect.left() + 8.0;
-    let number_rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x + number, y1));
-    x += number;
-    let title_rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x + title, y1));
-    x += title;
-    let artist_rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x + artist, y1));
-    x += artist;
-    let album_rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x + album, y1));
-    x += album;
-    let time_rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x + time, y1));
-    Columns {
-        number: number_rect,
-        title: title_rect,
-        artist: artist_rect,
-        album: album_rect,
-        time: time_rect,
+const COLUMN_PAD: f32 = 8.0;
+const MIN_NUMBER: f32 = 24.0;
+const MIN_TITLE: f32 = 60.0;
+const MIN_TEXT: f32 = 40.0;
+const MIN_TIME: f32 = 48.0;
+/// Pointer distance from a header divider that grabs it.
+const DIVIDER_GRAB: f32 = 4.0;
+
+/// Widths of the fixed playlist columns, in points. Title takes what is left.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct ColumnWidths {
+    #[serde(default = "default_number_width")]
+    number: f32,
+    #[serde(default = "default_text_width")]
+    artist: f32,
+    #[serde(default = "default_text_width")]
+    album: f32,
+    #[serde(default = "default_time_width")]
+    time: f32,
+}
+
+fn default_number_width() -> f32 {
+    44.0
+}
+
+fn default_text_width() -> f32 {
+    180.0
+}
+
+fn default_time_width() -> f32 {
+    72.0
+}
+
+impl Default for ColumnWidths {
+    fn default() -> Self {
+        Self {
+            number: default_number_width(),
+            artist: default_text_width(),
+            album: default_text_width(),
+            time: default_time_width(),
+        }
     }
 }
 
-fn column_header(ui: &mut egui::Ui) {
+/// The edge between two header columns that can be dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Divider {
+    NumberTitle,
+    TitleArtist,
+    ArtistAlbum,
+    AlbumTime,
+}
+
+impl ColumnWidths {
+    /// Replace values a hand-edited or damaged settings file could hold.
+    fn sanitized(self) -> Self {
+        let fix = |value: f32, min: f32, default: f32| {
+            if value.is_finite() {
+                value.clamp(min, 2000.0)
+            } else {
+                default
+            }
+        };
+        Self {
+            number: fix(self.number, MIN_NUMBER, default_number_width()),
+            artist: fix(self.artist, MIN_TEXT, default_text_width()),
+            album: fix(self.album, MIN_TEXT, default_text_width()),
+            time: fix(self.time, MIN_TIME, default_time_width()),
+        }
+    }
+
+    /// Widths used for a row of `width`. Artist and album give way when title would
+    /// fall under its minimum.
+    fn fit(&self, width: f32) -> [f32; 5] {
+        let avail = (width - COLUMN_PAD).max(0.0);
+        let mut artist = self.artist;
+        let mut album = self.album;
+        let fixed = self.number + artist + album + self.time;
+        let deficit = MIN_TITLE - (avail - fixed);
+        if deficit > 0.0 {
+            let flexible = artist + album;
+            let keep = ((flexible - deficit) / flexible).max(0.0);
+            artist *= keep;
+            album *= keep;
+        }
+        let title = (avail - self.number - artist - album - self.time).max(0.0);
+        [self.number, title, artist, album, self.time]
+    }
+
+    /// Move `divider` by `dx`. The columns on both sides of it trade width, so the
+    /// divider follows the pointer and the other edges stay put.
+    fn drag(&mut self, divider: Divider, dx: f32, width: f32) {
+        let [_, title, ..] = self.fit(width);
+        let title_room = (title - MIN_TITLE).max(0.0);
+        match divider {
+            Divider::NumberTitle => {
+                let dx = dx.clamp(MIN_NUMBER - self.number, title_room);
+                self.number += dx;
+            }
+            Divider::TitleArtist => {
+                let dx = dx.clamp(-title_room, self.artist - MIN_TEXT);
+                self.artist -= dx;
+            }
+            Divider::ArtistAlbum => {
+                let dx = dx.clamp(MIN_TEXT - self.artist, self.album - MIN_TEXT);
+                self.artist += dx;
+                self.album -= dx;
+            }
+            Divider::AlbumTime => {
+                let dx = dx.clamp(MIN_TEXT - self.album, self.time - MIN_TIME);
+                self.album += dx;
+                self.time -= dx;
+            }
+        }
+    }
+
+    fn reset(&mut self, divider: Divider) {
+        let defaults = Self::default();
+        match divider {
+            Divider::NumberTitle => self.number = defaults.number,
+            Divider::TitleArtist => self.artist = defaults.artist,
+            Divider::ArtistAlbum => {
+                self.artist = defaults.artist;
+                self.album = defaults.album;
+            }
+            Divider::AlbumTime => {
+                self.album = defaults.album;
+                self.time = defaults.time;
+            }
+        }
+    }
+}
+
+fn columns_for(rect: egui::Rect, widths: &ColumnWidths) -> Columns {
+    let y0 = rect.top();
+    let y1 = rect.bottom();
+    let mut x = rect.left() + COLUMN_PAD;
+    let mut next = |width: f32| {
+        let column = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x + width, y1));
+        x += width;
+        column
+    };
+    let [number, title, artist, album, time] = widths.fit(rect.width());
+    Columns {
+        number: next(number),
+        title: next(title),
+        artist: next(artist),
+        album: next(album),
+        time: next(time),
+    }
+}
+
+/// Draw the header and let its dividers be dragged. Double-click a divider to reset it.
+/// Returns true when a width changed.
+fn column_header(ui: &mut egui::Ui, widths: &mut ColumnWidths) -> bool {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 22.0), egui::Sense::hover());
-    let columns = columns_for(rect);
+    let columns = columns_for(rect, widths);
     let color = ui.visuals().weak_text_color();
     for (label, column, align) in [
         ("#", columns.number, egui::Align2::LEFT_CENTER),
@@ -2440,6 +2575,45 @@ fn column_header(ui: &mut egui::Ui) {
     ] {
         paint_text(ui, column, label, color, false, align);
     }
+    let mut changed = false;
+    for (divider, x) in [
+        (Divider::NumberTitle, columns.number.right()),
+        (Divider::TitleArtist, columns.title.right()),
+        (Divider::ArtistAlbum, columns.artist.right()),
+        (Divider::AlbumTime, columns.album.right()),
+    ] {
+        let grab = egui::Rect::from_min_max(
+            egui::pos2(x - DIVIDER_GRAB, rect.top()),
+            egui::pos2(x + DIVIDER_GRAB, rect.bottom()),
+        );
+        let id = ui.id().with(("column_divider", divider as u8));
+        let response = ui
+            .interact(grab, id, egui::Sense::click_and_drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeColumn);
+        if response.double_clicked() {
+            widths.reset(divider);
+            changed = true;
+        } else if response.dragged() {
+            let dx = response.drag_delta().x;
+            if dx != 0.0 {
+                widths.drag(divider, dx, width);
+                changed = true;
+            }
+        }
+        let active = response.hovered() || response.dragged();
+        let stroke = if active {
+            egui::Stroke::new(2.0, ACCENT)
+        } else {
+            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+        };
+        let inset = if active { 2.0 } else { 5.0 };
+        ui.painter().vline(
+            x,
+            egui::Rangef::new(rect.top() + inset, rect.bottom() - inset),
+            stroke,
+        );
+    }
+    changed
 }
 
 fn paint_text(
@@ -3045,5 +3219,70 @@ mod tests {
         assert!(!off_json.contains("session"));
         let off_back: Settings = serde_json::from_str(&off_json).unwrap();
         assert!(!off_back.resume_playback);
+    }
+
+    #[test]
+    fn column_dividers_follow_the_pointer_and_respect_minimums() {
+        let width = 800.0;
+        let edges = |w: &ColumnWidths| {
+            let mut x = COLUMN_PAD;
+            w.fit(width).map(|column| {
+                x += column;
+                x
+            })
+        };
+        let mut widths = ColumnWidths::default();
+        let before = edges(&widths);
+        widths.drag(Divider::ArtistAlbum, 30.0, width);
+        let after = edges(&widths);
+        assert_eq!(after[2], before[2] + 30.0);
+        assert_eq!(after[1], before[1]);
+        assert_eq!(after[3], before[3]);
+        widths.drag(Divider::TitleArtist, -50.0, width);
+        assert_eq!(edges(&widths)[1], before[1] - 50.0);
+        assert_eq!(edges(&widths)[2], after[2]);
+        widths.drag(Divider::AlbumTime, 1000.0, width);
+        assert_eq!(widths.time, MIN_TIME);
+        widths.drag(Divider::NumberTitle, -1000.0, width);
+        assert_eq!(widths.number, MIN_NUMBER);
+        widths.drag(Divider::TitleArtist, 5000.0, width);
+        assert!(widths.fit(width)[1] >= MIN_TITLE - 0.01);
+        let total: f32 = widths.fit(width).iter().sum();
+        assert!((total - (width - COLUMN_PAD)).abs() < 0.01);
+    }
+
+    #[test]
+    fn narrow_window_shrinks_artist_and_album_before_title() {
+        let widths = ColumnWidths::default();
+        let fitted = widths.fit(300.0);
+        assert!((fitted[1] - MIN_TITLE).abs() < 0.01);
+        assert!(fitted[2] < widths.artist);
+        assert_eq!(fitted[0], widths.number);
+        assert_eq!(fitted[4], widths.time);
+    }
+
+    #[test]
+    fn column_widths_persist_and_old_settings_get_defaults() {
+        let parsed: Settings = serde_json::from_str(r#"{"volume":0.4}"#).unwrap();
+        assert_eq!(parsed.columns, ColumnWidths::default());
+        let stored = Settings {
+            columns: ColumnWidths {
+                number: 30.0,
+                artist: 120.0,
+                album: 90.0,
+                time: 60.0,
+            },
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
+        assert_eq!(back.columns, stored.columns);
+        let bad = ColumnWidths {
+            number: f32::NAN,
+            artist: 1.0,
+            ..ColumnWidths::default()
+        }
+        .sanitized();
+        assert_eq!(bad.number, default_number_width());
+        assert_eq!(bad.artist, MIN_TEXT);
     }
 }
