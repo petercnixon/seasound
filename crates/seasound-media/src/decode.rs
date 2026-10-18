@@ -3,7 +3,6 @@
 //! `enable_gapless` stays off. Delay and padding passed in by the probe are applied
 //! here, once, so cue points and chapter points are presentation frames.
 
-use std::fs::File;
 use std::path::Path;
 
 use seasound_model::{ChannelMap, DecodeParams, Error, PcmSource};
@@ -62,8 +61,8 @@ struct SymphoniaSource {
 
 impl SymphoniaSource {
     fn open(path: &Path, params: DecodeParams) -> Result<Self, Error> {
-        let file = File::open(path)?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let source = crate::flac::open_media_source(path)?;
+        let mss = MediaSourceStream::new(source, Default::default());
         let mut hint = Hint::new();
         if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
             hint.with_extension(ext);
