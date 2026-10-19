@@ -1,5 +1,6 @@
 //! Commands from the window, and the thread that keeps the output ring full.
 
+use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -188,6 +189,8 @@ fn playback_thread(
         muted: false,
         state: PlayState::Stopped,
         error: None,
+        gave_up: HashSet::new(),
+        pending_retry: None,
         spans: Vec::new(),
         queued: 0,
         origin: output.played(),
@@ -300,7 +303,7 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
             deck.halt(output);
         }
         Command::PlayIndex(index) => {
-            if deck.playable(index) {
+            if deck.playable(index) || deck.reopen(index, true) {
                 deck.begin(index, output);
             }
         }
@@ -316,6 +319,7 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
             PlayState::Stopped => {
                 let index = deck.cursor.index().or_else(|| deck.first_playable());
                 if let Some(index) = index {
+                    let _ = deck.reopen(index, true);
                     deck.begin(index, output);
                 }
             }
@@ -330,10 +334,13 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
             deck.origin = output.played();
         }
         Command::Next => {
-            if let Some(index) = deck.after_current() {
-                deck.begin(index, output);
-            } else {
-                deck.state = PlayState::Stopped;
+            if let Some(current) = deck.cursor.index() {
+                if let Some(index) = deck.advance_from(current, true) {
+                    let _ = deck.reopen(index, true);
+                    deck.begin(index, output);
+                } else {
+                    deck.state = PlayState::Stopped;
+                }
             }
         }
         Command::Previous => {
@@ -342,10 +349,14 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
             match deck.cursor.back(elapsed) {
                 seasound_model::Back::Restart => {
                     if let Some(index) = restart_index {
+                        let _ = deck.reopen(index, true);
                         deck.begin(index, output);
                     }
                 }
-                seasound_model::Back::To(index) => deck.begin(index, output),
+                seasound_model::Back::To(index) => {
+                    let _ = deck.reopen(index, true);
+                    deck.begin(index, output);
+                }
                 seasound_model::Back::Stop => deck.state = PlayState::Stopped,
             }
         }
@@ -497,6 +508,12 @@ struct Deck {
     muted: bool,
     state: PlayState,
     error: Option<String>,
+    /// Files that failed to open since the last file that did open.
+    /// A natural advance tries each of them once, then leaves them until the
+    /// user asks again or another file opens.
+    gave_up: HashSet<SourceId>,
+    /// The file whose row error was cleared for the attempt now in progress.
+    pending_retry: Option<SourceId>,
     spans: Vec<Span>,
     queued: u64,
     origin: u64,
@@ -560,6 +577,8 @@ impl Deck {
         self.cursor.set_repeat(Repeat::Off);
         self.refresh_rows();
         self.error = None;
+        self.gave_up.clear();
+        self.pending_retry = None;
         self.inflight = None;
     }
 
@@ -583,15 +602,99 @@ impl Deck {
     }
 
     /// Remember why this file cannot play, then let the cursor move on.
+    ///
+    /// The decoder is dropped. The next attempt has to open the file again.
     fn mark_unplayable(&mut self, id: SourceId, message: &str) {
         let message = message.to_string();
         if let Some(source) = self.playlist.sources.iter_mut().find(|source| source.id == id) {
-            if source.error.is_none() {
-                source.error = Some(message.clone());
-            }
+            source.error = Some(message.clone());
+        }
+        if self.pending_retry == Some(id) {
+            self.pending_retry = None;
+        }
+        self.gave_up.insert(id);
+        self.core.forget(id);
+        if self.inflight.as_ref().is_some_and(|inflight| inflight.id == id) {
+            self.inflight = None;
         }
         self.error = Some(message);
         self.refresh_rows();
+    }
+
+    /// This row failed to open, but the playlist already knows its timing.
+    ///
+    /// A probe failure has no timing, so there is nothing to open again.
+    /// `force` is a user request. It tries a file that already failed once
+    /// during this pass. A natural advance does not, or a dead network would
+    /// open the same file on every tick.
+    fn can_reopen(&self, index: usize, force: bool) -> bool {
+        let Some(entry) = self.playlist.entries.get(index) else {
+            return false;
+        };
+        if !force && self.gave_up.contains(&entry.source_id) {
+            return false;
+        }
+        let Some(source) = self.playlist.source(entry.source_id) else {
+            return false;
+        };
+        source.error.is_some() && has_playback_timing(source, entry.segment)
+    }
+
+    /// Clear the row error so the next open is a fresh load. Returns false when
+    /// this row cannot be tried.
+    fn reopen(&mut self, index: usize, force: bool) -> bool {
+        if !self.can_reopen(index, force) {
+            return false;
+        }
+        let Some(entry) = self.playlist.entries.get(index).cloned() else {
+            return false;
+        };
+        self.gave_up.remove(&entry.source_id);
+        if let Some(source) = self
+            .playlist
+            .sources
+            .iter_mut()
+            .find(|source| source.id == entry.source_id)
+        {
+            source.error = None;
+        }
+        self.pending_retry = Some(entry.source_id);
+        self.core.forget(entry.source_id);
+        if self.inflight.as_ref().is_some_and(|inflight| inflight.id == entry.source_id) {
+            self.inflight = None;
+        }
+        self.refresh_rows();
+        true
+    }
+
+    /// The retried file opened. Other rows that failed the same way can load too.
+    fn note_recovered(&mut self, id: SourceId) {
+        let recovered = self.pending_retry == Some(id);
+        self.gave_up.clear();
+        if !recovered {
+            return;
+        }
+        self.pending_retry = None;
+        let mut changed = false;
+        for source in &mut self.playlist.sources {
+            if source.id == id || source.error.is_none() {
+                continue;
+            }
+            let timed = source.sample_rate > 0
+                && source.presentation_frames > 0
+                && source
+                    .segments
+                    .iter()
+                    .any(|segment| segment.end_frame > segment.start_frame);
+            if timed {
+                source.error = None;
+                changed = true;
+            }
+        }
+        if changed {
+            self.refresh_rows();
+        }
+        self.consider_prefetch();
     }
 
     fn playable(&self, index: usize) -> bool {
@@ -627,6 +730,16 @@ impl Deck {
         self.origin = output.played();
         self.seek_frame = None;
         self.error = None;
+        if let Some(pending) = self.pending_retry {
+            let same = self
+                .playlist
+                .entries
+                .get(index)
+                .is_some_and(|entry| entry.source_id == pending);
+            if !same {
+                self.pending_retry = None;
+            }
+        }
         self.consider_prefetch();
     }
 
@@ -675,7 +788,12 @@ impl Deck {
                 break;
             };
             if !self.playable(index) {
-                if self.advance_from(index).is_none() {
+                // Landing here from the previous row, or from Play, tries the file
+                // again. A row that just failed in this pass is left alone.
+                if self.reopen(index, false) {
+                    continue;
+                }
+                if self.advance_from(index, false).is_none() {
                     break;
                 }
                 continue;
@@ -688,13 +806,13 @@ impl Deck {
                         waiting: true,
                     });
                 }
-                Ok(true) => {}
+                Ok(true) => self.note_recovered(job.source_id),
                 Err(err) => {
                     // The row stays. A bad path, a down network, or garbage timing
                     // must not stop the rest of the playlist.
                     self.mark_unplayable(job.source_id, err.message());
                     self.seek_frame = None;
-                    if self.advance_from(index).is_none() {
+                    if self.advance_from(index, false).is_none() {
                         break;
                     }
                     continue;
@@ -711,7 +829,7 @@ impl Deck {
                 Err(err) => {
                     self.mark_unplayable(job.source_id, err.message());
                     self.seek_frame = None;
-                    if self.advance_from(index).is_none() {
+                    if self.advance_from(index, false).is_none() {
                         break;
                     }
                     continue;
@@ -737,14 +855,14 @@ impl Deck {
             }
             if pulled.frames == 0 {
                 if self.core.job_done(job) {
-                    if self.advance_from(index).is_none() {
+                    if self.advance_from(index, false).is_none() {
                         break;
                     }
                     continue;
                 }
                 break;
             }
-            if self.core.job_done(job) && self.advance_from(index).is_none() {
+            if self.core.job_done(job) && self.advance_from(index, false).is_none() {
                 break;
             }
         }
@@ -932,13 +1050,16 @@ impl Deck {
             || current_entry.source_id != next_entry.source_id
     }
 
-    fn advance_from(&mut self, current: usize) -> Option<usize> {
+    /// `force` lands on a row that already failed during this pass. Next and
+    /// Previous ask for that. The fill loop does not, so one dead file is not
+    /// opened again until something else succeeds or the user asks.
+    fn advance_from(&mut self, current: usize, force: bool) -> Option<usize> {
         let len = self.playlist.entries.len().max(1);
         for _ in 0..len + 1 {
             match self.cursor.advance() {
                 seasound_model::Step::Stop => return None,
                 seasound_model::Step::To(index) => {
-                    if index != current && self.playable(index) {
+                    if index != current && (self.playable(index) || self.can_reopen(index, force)) {
                         self.display_index = Some(index);
                         self.consider_prefetch();
                         return Some(index);
@@ -952,11 +1073,6 @@ impl Deck {
             }
         }
         None
-    }
-
-    fn after_current(&mut self) -> Option<usize> {
-        let current = self.cursor.index()?;
-        self.advance_from(current)
     }
 
     fn note_written(&mut self, frames: u64) {
@@ -1060,6 +1176,16 @@ impl Deck {
             .saturating_sub(segment.start_frame)
             .min(frames.saturating_sub(1));
         Some((index, position, frames, rate))
+    }
+}
+
+fn has_playback_timing(source: &Source, segment: usize) -> bool {
+    if source.sample_rate == 0 || source.presentation_frames == 0 {
+        return false;
+    }
+    match source.segments.get(segment) {
+        Some(segment) => segment.end_frame > segment.start_frame,
+        None => false,
     }
 }
 
@@ -1472,6 +1598,171 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn playback_reloads_an_error_row_it_reaches_and_clears_the_other_load_errors() {
+        let mut broken = source("b", 44_100 * 60);
+        broken.error = Some("network down".into());
+        let mut also = source("c", 44_100 * 60);
+        also.error = Some("network down".into());
+        let mut unsupported = source("notes.opus", 0);
+        unsupported.sample_rate = 0;
+        unsupported.presentation_frames = 0;
+        unsupported.segments[0].end_frame = 0;
+        unsupported.error = Some("not supported".into());
+        let opener: Opener = Arc::new(|source| {
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let engine = Engine::start_with(opener, Box::new(memory));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("a", 4_000), broken, also, unsupported]),
+            autoplay: true,
+            start: None,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let playing_b = snapshot.state == PlayState::Playing
+                && snapshot.title == "b"
+                && snapshot.rows[1].error.is_none()
+                && snapshot.rows[2].error.is_none()
+                && snapshot.rows[3].error.as_deref() == Some("not supported")
+                && recorded.lock().unwrap().len() > 4_000;
+            if playing_b {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "did not reload the error row: {:?} {} index {:?} errors [{:?}, {:?}, {:?}, {:?}]",
+                    snapshot.state,
+                    snapshot.title,
+                    snapshot.index,
+                    snapshot.rows.first().and_then(|row| row.error.clone()),
+                    snapshot.rows.get(1).and_then(|row| row.error.clone()),
+                    snapshot.rows.get(2).and_then(|row| row.error.clone()),
+                    snapshot.rows.get(3).and_then(|row| row.error.clone()),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn playing_an_error_row_loads_it_again_and_clears_the_other_load_errors() {
+        let seen = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
+        let record = Arc::clone(&seen);
+        let opener: Opener = Arc::new(move |source| {
+            if source.title == "b" || source.title == "c" {
+                let mut opened = record.lock().unwrap();
+                if opened.insert(source.title.clone()) {
+                    return Err(Error::new("network down"));
+                }
+            }
+            Ok(Box::new(Ramp {
+                len: source.presentation_frames,
+                pos: 0,
+            }))
+        });
+        let mut unsupported = source("notes.opus", 0);
+        unsupported.sample_rate = 0;
+        unsupported.presentation_frames = 0;
+        unsupported.segments[0].end_frame = 0;
+        unsupported.error = Some("not supported".into());
+        let memory = MemoryOutput::new(44100);
+        let engine = Engine::start_with(opener, Box::new(memory));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![
+                source("a", 2_000),
+                source("b", u64::MAX / 4),
+                source("c", u64::MAX / 4),
+                unsupported,
+            ]),
+            autoplay: true,
+            start: None,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let settled = snapshot.rows.len() == 4
+                && snapshot.rows[1].error.is_some()
+                && snapshot.rows[2].error.is_some()
+                && snapshot.state != PlayState::Playing;
+            if settled {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "the failed rows were not left stopped: {:?} {} {:?}",
+                    snapshot.state,
+                    snapshot.title,
+                    snapshot
+                        .rows
+                        .iter()
+                        .map(|row| row.error.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        engine.command(Command::PlayIndex(1));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let playing = snapshot.state == PlayState::Playing
+                && snapshot.title == "b"
+                && snapshot.rows[1].error.is_none()
+                && snapshot.rows[2].error.is_none()
+                && snapshot.rows[3].error.as_deref() == Some("not supported");
+            if playing {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "playing the error row did not reload it: {:?} {} {:?}",
+                    snapshot.state,
+                    snapshot.title,
+                    snapshot
+                        .rows
+                        .iter()
+                        .map(|row| row.error.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        engine.command(Command::PlayIndex(3));
+        thread::sleep(Duration::from_millis(80));
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.title, "b");
+        assert_eq!(snapshot.rows[3].error.as_deref(), Some("not supported"));
+    }
+
+    #[test]
+    fn a_file_that_keeps_failing_is_not_opened_on_every_tick() {
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&opens);
+        let opener: Opener = Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::new("still down"))
+        });
+        let engine = Engine::start_with(opener, Box::new(MemoryOutput::new(44100)));
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("gone.flac", 44_100)]),
+            autoplay: true,
+            start: None,
+        });
+        thread::sleep(Duration::from_millis(400));
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, PlayState::Stopped);
+        assert!(snapshot.rows[0].error.is_some());
+        let opened = opens.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(opened < 4, "the failed file was opened {opened} times");
     }
 
     #[test]

@@ -1252,10 +1252,10 @@ impl SeaSoundApp {
             self.selected.clear();
             self.selected.insert(row.index);
             self.row_drag = None;
-            if row.error.is_none() {
-                self.engine.command(Command::PlayIndex(row.index));
-                self.settle = 15;
-            }
+            // An error row is tried again. A file that failed because the network
+            // was down can play once the path is reachable, without a restart.
+            self.engine.command(Command::PlayIndex(row.index));
+            self.settle = 15;
             return None;
         }
 

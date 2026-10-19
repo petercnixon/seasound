@@ -118,6 +118,21 @@ impl PlayerCore {
         self.overflow.clear();
     }
 
+    /// Drop a decoder that failed. A later play of this file has to open it again.
+    ///
+    /// A prefetch for a different file stays. The resampler output from the failed
+    /// file is discarded so it is not played as the start of the next one.
+    pub fn forget(&mut self, id: SourceId) {
+        if self.active.as_ref().is_some_and(|active| active.id == id) {
+            self.active = None;
+            self.overflow.clear();
+            self.force_seek = true;
+        }
+        if self.waiting.as_ref().is_some_and(|(waiting, _)| *waiting == id) {
+            self.waiting = None;
+        }
+    }
+
     /// Drop the open decoder. The next pull has to be given a new one.
     ///
     /// Call this when the playlist is replaced. Source ids are not a guarantee
