@@ -17,7 +17,6 @@ pub trait AudioOut {
     fn set_paused(&mut self, paused: bool);
     fn set_gain(&mut self, gain: f32);
     fn played(&self) -> u64;
-    fn underruns(&self) -> u64;
     fn device_name(&self) -> String;
     fn devices(&self) -> Vec<String>;
     fn set_device(&mut self, name: Option<&str>) -> Result<(), Error>;
@@ -88,10 +87,6 @@ impl AudioOut for MemoryOutput {
         self.played
     }
 
-    fn underruns(&self) -> u64 {
-        0
-    }
-
     fn device_name(&self) -> String {
         "Test output".into()
     }
@@ -116,7 +111,6 @@ mod cpal_out {
         gain: AtomicU32,
         paused: AtomicBool,
         played: AtomicU64,
-        underruns: AtomicU64,
         channels: usize,
         /// Gain already applied. It has to survive from one callback to the next,
         /// because `gain` is the target and a fresh read of it would skip the ramp.
@@ -182,7 +176,6 @@ mod cpal_out {
                 gain: AtomicU32::new(1.0f32.to_bits()),
                 paused: AtomicBool::new(false),
                 played: AtomicU64::new(0),
-                underruns: AtomicU64::new(0),
                 channels: channels.max(1),
                 applied: AtomicU32::new(0),
             });
@@ -265,13 +258,6 @@ mod cpal_out {
             self.shared.as_ref().map(|shared| shared.played.load(Ordering::Relaxed)).unwrap_or(0)
         }
 
-        fn underruns(&self) -> u64 {
-            self.shared
-                .as_ref()
-                .map(|shared| shared.underruns.load(Ordering::Relaxed))
-                .unwrap_or(0)
-        }
-
         fn device_name(&self) -> String {
             if self.name.is_empty() {
                 "No device".into()
@@ -350,11 +336,9 @@ mod cpal_out {
         let available = consumer.slots() / 2;
         let take = available.min(frames);
         if take == 0 {
-            shared.underruns.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let Ok(chunk) = consumer.read_chunk(take * 2) else {
-            shared.underruns.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let (first, second) = chunk.as_slices();
@@ -389,9 +373,6 @@ mod cpal_out {
         chunk.commit_all();
         shared.applied.store(gain.to_bits(), Ordering::Relaxed);
         shared.played.fetch_add(take as u64, Ordering::Relaxed);
-        if take < frames {
-            shared.underruns.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     fn write_f32(sample: &mut f32, value: f32) {

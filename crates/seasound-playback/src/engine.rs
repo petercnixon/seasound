@@ -31,7 +31,6 @@ pub struct Snapshot {
     pub title: String,
     pub artist: String,
     pub album: String,
-    pub underruns: u64,
     pub error: Option<String>,
     pub device: String,
     pub devices: Arc<Vec<String>>,
@@ -53,7 +52,6 @@ impl Default for Snapshot {
             title: String::new(),
             artist: String::new(),
             album: String::new(),
-            underruns: 0,
             error: None,
             device: String::new(),
             devices: Arc::new(Vec::new()),
@@ -1226,7 +1224,6 @@ fn publish(deck: &Deck, output: &dyn AudioOut, published: &Mutex<Snapshot>) {
         title: row.map(|row| row.title.clone()).unwrap_or_default(),
         artist: row.map(|row| row.artist.clone()).unwrap_or_default(),
         album: row.map(|row| row.album.clone()).unwrap_or_default(),
-        underruns: output.underruns(),
         error: deck.error.clone().or_else(|| output.last_error()),
         device: output.device_name(),
         devices: Arc::new(output.devices()),
@@ -2134,9 +2131,6 @@ mod tests {
         fn played(&self) -> u64 {
             self.pushed.saturating_sub(self.lag)
         }
-        fn underruns(&self) -> u64 {
-            0
-        }
         fn device_name(&self) -> String {
             "lag".into()
         }
@@ -2611,9 +2605,6 @@ mod tests {
         fn set_gain(&mut self, _gain: f32) {}
         fn played(&self) -> u64 {
             self.shared.lock().unwrap().played
-        }
-        fn underruns(&self) -> u64 {
-            0
         }
         fn device_name(&self) -> String {
             "clock".into()

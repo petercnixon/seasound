@@ -1108,9 +1108,6 @@ impl SeaSoundApp {
                 parts.push(warning.clone());
             }
         }
-        if snap.underruns > 0 {
-            parts.push(format!("underruns: {}", snap.underruns));
-        }
         if let Some(path) = &self.playlist_path {
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 parts.push(name.to_string());
