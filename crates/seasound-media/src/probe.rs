@@ -649,9 +649,21 @@ fn mp4_segments(path: &Path, source: &Source) -> Result<Option<Vec<Segment>>, St
     }
 }
 
-fn apply_segments(source: &mut Source, segments: Vec<Segment>, album: &str) {
+fn apply_segments(source: &mut Source, mut segments: Vec<Segment>, album: &str) {
     if !album.is_empty() && source.album.is_empty() {
         source.album = album.to_string();
+    }
+    // A cue track keeps its own REM DISCNUMBER. A blank one takes the file tag.
+    // Chapters have no per-chapter disc, so they take the file's disk atom.
+    for segment in &mut segments {
+        if segment.disc == 0 {
+            segment.disc = source.disc;
+        }
+    }
+    if source.disc == 0 {
+        if let Some(disc) = segments.iter().map(|segment| segment.disc).find(|disc| *disc > 0) {
+            source.disc = disc;
+        }
     }
     let group = if segments.len() > 1 {
         Some(if source.album.is_empty() {
@@ -667,8 +679,11 @@ fn apply_segments(source: &mut Source, segments: Vec<Segment>, album: &str) {
 }
 
 fn whole_file_segment(source: &Source) -> Segment {
+    // Disc stays unset here. A normal file keeps a plain track number even when
+    // its tags name a disc. Cue and chapter rows pick the disc up in apply_segments.
     Segment {
         number: source.track_number,
+        disc: 0,
         title: source.title.clone(),
         artist: source.artist.clone(),
         album: source.album.clone(),
@@ -914,6 +929,9 @@ fn read_tags(path: &Path) -> Tags {
                     tags.album_artist = artist.to_string();
                 }
             }
+            if tags.disc.is_none() {
+                tags.disc = mp4.disc_number().map(u32::from);
+            }
             if tags.cover.is_none() {
                 if let Some(art) = mp4.artwork() {
                     let mime = match art.fmt {
@@ -954,6 +972,7 @@ fn error_source(path: &Path, message: impl Into<String>) -> Source {
         track_number: 0,
         segments: vec![Segment {
             number: 0,
+            disc: 0,
             title: file_stem(path).to_string(),
             artist: String::new(),
             album: String::new(),
@@ -1046,6 +1065,7 @@ mod tests {
         for source in &playable {
             assert_eq!(source.format, AudioFormat::Mp3, "{}", source.path.display());
             assert_eq!(source.segments.len(), 1, "{}", source.path.display());
+            assert_eq!(source.segments[0].disc, 0, "{}", source.path.display());
             assert_eq!(source.delay, 1105, "{}", source.path.display());
             assert!(source.padding > 0, "{}", source.path.display());
             assert!(source.presentation_frames > source.sample_rate as u64);
@@ -1078,6 +1098,11 @@ mod tests {
             source.segments.len()
         );
         assert!(source.group_title.is_some());
+        assert!(
+            source.segments.iter().all(|segment| segment.disc == 0),
+            "a cue with no disc number keeps plain track numbers"
+        );
+        assert_eq!(source.segments[0].number, 1);
         for pair in source.segments.windows(2) {
             assert_eq!(pair[0].end_frame, pair[1].start_frame);
             assert!(!pair[0].title.is_empty());
@@ -1109,6 +1134,7 @@ mod tests {
         assert!(source.error.is_none(), "{:?}", source.error);
         assert_eq!(source.segments.len(), 17);
         assert_eq!(source.segments[0].title, "Good Time Boys");
+        assert!(source.segments.iter().all(|segment| segment.disc == 0));
         assert_eq!(source.segments.last().unwrap().end_frame, source.presentation_frames);
         let mut decoder =
             crate::decode::open_decoder(&path, seasound_model::DecodeParams::from(&source)).unwrap();
@@ -1138,6 +1164,9 @@ mod tests {
             source.sample_rate
         );
         assert_eq!(source.segments[0].title.to_ascii_lowercase(), "last resort");
+        assert_eq!(source.segments[0].number, 1);
+        assert_eq!(source.disc, 1, "the file disk atom is the chapter disc");
+        assert!(source.segments.iter().all(|segment| segment.disc == 1));
         assert!(source.segments[0].start_frame < source.sample_rate as u64);
         for pair in source.segments.windows(2) {
             assert_eq!(pair[0].end_frame, pair[1].start_frame);
@@ -1154,6 +1183,32 @@ mod tests {
         assert_eq!(source.bits_per_sample, 0);
         let kbps = source.bitrate_bps / 1000;
         assert!((32..=512).contains(&kbps), "bitrate {kbps} kbps");
+    }
+
+    #[test]
+    fn a_cued_disc_set_keeps_the_track_number_and_records_the_disc() {
+        let Some(examples) = examples() else {
+            return;
+        };
+        let first = examples.join("George Formby - The War and Postwar Years CD1.flac");
+        let second = examples.join("George Formby - The War and Postwar Years CD2.flac");
+        if !first.is_file() || !second.is_file() {
+            return;
+        }
+        let disc1 = probe_file(&first);
+        let disc2 = probe_file(&second);
+        assert!(disc1.error.is_none(), "{:?}", disc1.error);
+        assert!(disc2.error.is_none(), "{:?}", disc2.error);
+        assert_eq!(disc1.album, disc2.album);
+        assert_eq!(disc1.disc, 1);
+        assert_eq!(disc2.disc, 2);
+        assert!(disc1.segments.len() > 15, "tracks {}", disc1.segments.len());
+        assert_eq!(disc1.segments[0].number, 1);
+        assert_eq!(disc1.segments[0].disc, 1);
+        assert_eq!(disc1.segments[14].number, 15);
+        assert_eq!(disc1.segments[14].disc, 1);
+        assert_eq!(disc2.segments[0].number, 1);
+        assert_eq!(disc2.segments[0].disc, 2);
     }
 
     #[test]

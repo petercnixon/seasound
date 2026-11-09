@@ -1294,6 +1294,7 @@ mod tests {
             track_number: 1,
             segments: vec![Segment {
                 number: 1,
+                disc: 0,
                 title: path.into(),
                 artist: "Artist".into(),
                 album: "Album".into(),
@@ -1316,6 +1317,7 @@ mod tests {
             .enumerate()
             .map(|(index, (start, end))| Segment {
                 number: (index + 1) as u32,
+                disc: 0,
                 title: format!("Track {}", index + 1),
                 artist: "Artist".into(),
                 album: "Album".into(),

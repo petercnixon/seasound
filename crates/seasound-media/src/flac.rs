@@ -203,6 +203,7 @@ pub fn parse_cuesheet_block(body: &[u8]) -> Result<Vec<CueTrack>, String> {
         let audible = audible_start(&track);
         tracks.push(CueTrack {
             number: u32::from(track.number),
+            disc: 0,
             title: format!("Track {:02}", track.number),
             performer: String::new(),
             start_frame: audible,

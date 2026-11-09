@@ -98,6 +98,7 @@ impl Playlist {
                 source_id: source.id,
                 segment: entry.segment,
                 number: segment.number,
+                disc: segment.disc,
                 title: segment.title.clone(),
                 artist: segment.artist.clone(),
                 album: segment.album.clone(),
@@ -209,6 +210,7 @@ fn saved_row_from(
         padding: source.padding,
         presentation_frames: source.presentation_frames,
         number: segment.number,
+        disc: segment.disc,
         format_name: source.format_name().to_string(),
         group,
     }
@@ -280,6 +282,8 @@ pub struct RowView {
     pub source_id: SourceId,
     pub segment: usize,
     pub number: u32,
+    /// Disc of a set. Zero means the row has no disc number.
+    pub disc: u32,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -341,6 +345,9 @@ pub struct SavedRow {
     pub presentation_frames: u64,
     #[serde(default, skip_serializing_if = "zero_u32")]
     pub number: u32,
+    /// Disc of a set. Zero when the file did not say. `number` stays the track.
+    #[serde(default, skip_serializing_if = "zero_u32")]
+    pub disc: u32,
     /// `AudioFormat::label`, or a plugin name such as WavPack.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub format_name: String,
@@ -378,6 +385,7 @@ impl Default for SavedRow {
             padding: 0,
             presentation_frames: 0,
             number: 0,
+            disc: 0,
             format_name: String::new(),
             group: None,
         }
@@ -477,12 +485,16 @@ pub fn playlist_from_descriptions(rows: &[SavedRow]) -> Option<Playlist> {
         };
         sources[source_index].segments.push(crate::Segment {
             number,
+            disc: row.disc,
             title: row.title.clone(),
             artist: row.artist.clone(),
             album: row.album.clone(),
             start_frame: row.start_frame,
             end_frame: row.end_frame,
         });
+        if sources[source_index].disc == 0 {
+            sources[source_index].disc = row.disc;
+        }
         let heard = row.presentation_frames.max(row.end_frame);
         if sources[source_index].presentation_frames < heard {
             sources[source_index].presentation_frames = heard;
@@ -939,6 +951,7 @@ mod tests {
             segments: vec![
                 crate::Segment {
                     number: 1,
+                    disc: 0,
                     title: "Speak to Me".into(),
                     artist: String::new(),
                     album: String::new(),
@@ -947,6 +960,7 @@ mod tests {
                 },
                 crate::Segment {
                     number: 2,
+                    disc: 0,
                     title: "Breathe".into(),
                     artist: String::new(),
                     album: String::new(),
@@ -1031,6 +1045,7 @@ mod tests {
         source.segments = vec![
             crate::Segment {
                 number: 1,
+                disc: 3,
                 title: "Speak to Me".into(),
                 artist: "Pink Floyd".into(),
                 album: "Dark Side".into(),
@@ -1039,6 +1054,7 @@ mod tests {
             },
             crate::Segment {
                 number: 2,
+                disc: 3,
                 title: "Breathe".into(),
                 artist: "Pink Floyd".into(),
                 album: "Dark Side".into(),
@@ -1077,6 +1093,10 @@ mod tests {
         assert_eq!(again.entries.len(), 3);
         assert_eq!(again.sources[0].segments.len(), 2);
         assert_eq!(again.sources[0].segments[1].title, "Breathe");
+        assert_eq!(again.sources[0].segments[0].disc, 3);
+        assert_eq!(again.sources[0].segments[0].number, 1);
+        assert_eq!(again.rows()[0].disc, 3);
+        assert!(!saved.to_json().expect("json").contains("\"disc\":0"));
         assert_eq!(again.sources[0].delay, 576);
         assert_eq!(again.sources[0].padding, 1560);
         assert_eq!(again.sources[0].presentation_frames, 2500);
@@ -1130,6 +1150,7 @@ mod tests {
             track_number: 1,
             segments: vec![crate::Segment {
                 number: 1,
+                disc: 0,
                 title: path.into(),
                 artist: String::new(),
                 album: String::new(),

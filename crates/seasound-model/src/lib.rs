@@ -111,6 +111,10 @@ impl AudioFormat {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Segment {
     pub number: u32,
+    /// Disc of a set. Zero means this row has no disc number.
+    /// The track number stays in `number`. The playlist draws `1.01` from the two.
+    #[serde(default)]
+    pub disc: u32,
     pub title: String,
     pub artist: String,
     pub album: String,

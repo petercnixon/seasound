@@ -1420,11 +1420,7 @@ impl SeaSoundApp {
                 } else {
                     ui.visuals().text_color()
                 };
-                let number = if row.number == 0 {
-                    String::new()
-                } else {
-                    row.number.to_string()
-                };
+                let number = track_number_label(row.disc, row.number);
                 let time = if let Some(error) = &row.error {
                     error.clone()
                 } else {
@@ -2062,6 +2058,7 @@ fn saved_playlist(rows: &[RowView], position: Option<SavedPosition>) -> SavedPla
                 padding: row.padding,
                 presentation_frames: row.presentation_frames,
                 number: row.number,
+                disc: row.disc,
                 format_name: row.format_name.clone(),
                 group: row.group.clone(),
             })
@@ -2863,6 +2860,18 @@ fn column_header(ui: &mut egui::Ui, layout: &mut ColumnLayout) -> bool {
     changed
 }
 
+/// Foobar's track column: `3.15` when a disc is set, otherwise the track on its own.
+/// A missing disc stays a plain number so other formats are unchanged.
+fn track_number_label(disc: u32, number: u32) -> String {
+    if number == 0 {
+        String::new()
+    } else if disc == 0 {
+        number.to_string()
+    } else {
+        format!("{disc}.{number:02}")
+    }
+}
+
 fn paint_text(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -2906,6 +2915,7 @@ mod tests {
             source_id: SourceId(1),
             segment: index,
             number: (index + 1) as u32,
+            disc: 0,
             title: title.into(),
             artist: "Artist".into(),
             album: "Album".into(),
@@ -2923,6 +2933,16 @@ mod tests {
             error: None,
             path: PathBuf::from("/music/album.flac"),
         }
+    }
+
+    #[test]
+    fn track_column_prefixes_a_disc_and_leaves_a_plain_number_alone() {
+        assert_eq!(track_number_label(0, 0), "");
+        assert_eq!(track_number_label(0, 1), "1");
+        assert_eq!(track_number_label(0, 15), "15");
+        assert_eq!(track_number_label(1, 1), "1.01");
+        assert_eq!(track_number_label(3, 15), "3.15");
+        assert_eq!(track_number_label(12, 100), "12.100");
     }
 
     #[test]
@@ -3325,6 +3345,7 @@ mod tests {
             segments: vec![
                 seasound_model::Segment {
                     number: 1,
+                    disc: 0,
                     title: "One".into(),
                     artist: String::new(),
                     album: String::new(),
@@ -3333,6 +3354,7 @@ mod tests {
                 },
                 seasound_model::Segment {
                     number: 2,
+                    disc: 0,
                     title: "Two".into(),
                     artist: String::new(),
                     album: String::new(),

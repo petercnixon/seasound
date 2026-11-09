@@ -49,6 +49,7 @@ pub fn segments_from_chapters(
         };
         segments.push(Segment {
             number: (index + 1) as u32,
+            disc: 0,
             title,
             artist: artist.to_string(),
             album: album.to_string(),

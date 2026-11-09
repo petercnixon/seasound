@@ -9,6 +9,8 @@ use seasound_model::Segment;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CueTrack {
     pub number: u32,
+    /// Disc of a set from `REM DISCNUMBER`. Zero when the sheet does not say.
+    pub disc: u32,
     pub title: String,
     pub performer: String,
     /// INDEX 01, in presentation frames. INDEX 00 is the pregap and is not the start.
@@ -45,6 +47,9 @@ pub fn parse_cue_text(text: &str, sample_rate: u32) -> Result<Vec<CueFile>, Stri
     let mut album_performer = String::new();
     let mut album_title = String::new();
     let mut in_track = false;
+    let mut indexed = false;
+    // Carried onto each new track. A later REM changes the tracks that follow.
+    let mut disc = 0u32;
 
     for raw in text.lines() {
         let line = raw.trim();
@@ -57,8 +62,26 @@ pub fn parse_cue_text(text: &str, sample_rate: u32) -> Result<Vec<CueFile>, Stri
         }
         let command = parts.remove(0).to_ascii_uppercase();
         match command.as_str() {
-            "REM" | "FLAGS" | "PREGAP" | "POSTGAP" | "SONGWRITER" | "ISRC" | "CATALOG"
-            | "CDTEXTFILE" => {}
+            "REM" => {
+                let key = parts
+                    .first()
+                    .map(|part| part.to_ascii_uppercase())
+                    .unwrap_or_default();
+                if key == "DISCNUMBER" || key == "DISKNUMBER" {
+                    let Some(value) = parts.get(1).and_then(|token| parse_disc_number(token)) else {
+                        continue;
+                    };
+                    disc = value;
+                    // A REM before the first INDEX still belongs to this track.
+                    // One after the index belongs to the tracks that follow.
+                    if in_track && !indexed {
+                        if let Some(track) = files.last_mut().and_then(|file| file.tracks.last_mut()) {
+                            track.disc = value;
+                        }
+                    }
+                }
+            }
+            "FLAGS" | "PREGAP" | "POSTGAP" | "SONGWRITER" | "ISRC" | "CATALOG" | "CDTEXTFILE" => {}
             "PERFORMER" => {
                 let value = join_rest(&parts);
                 if in_track {
@@ -81,6 +104,7 @@ pub fn parse_cue_text(text: &str, sample_rate: u32) -> Result<Vec<CueFile>, Stri
             }
             "FILE" => {
                 in_track = false;
+                indexed = false;
                 let file_name = if parts.len() >= 2 {
                     parts[..parts.len() - 1].join(" ")
                 } else {
@@ -93,6 +117,7 @@ pub fn parse_cue_text(text: &str, sample_rate: u32) -> Result<Vec<CueFile>, Stri
             }
             "TRACK" => {
                 in_track = true;
+                indexed = false;
                 if files.is_empty() {
                     files.push(CueFile {
                         file_name: String::new(),
@@ -109,12 +134,14 @@ pub fn parse_cue_text(text: &str, sample_rate: u32) -> Result<Vec<CueFile>, Stri
                 let file = files.last_mut().expect("a file was just ensured");
                 file.tracks.push(CueTrack {
                     number,
+                    disc,
                     title: String::new(),
                     performer: album_performer.clone(),
                     start_frame: 0,
                 });
             }
             "INDEX" => {
+                indexed = true;
                 let (Some(which), Some(stamp)) = (parts.first(), parts.get(1)) else {
                     continue;
                 };
@@ -197,6 +224,7 @@ pub fn segments_from_cue(
         }
         segments.push(Segment {
             number: track.number,
+            disc: track.disc,
             title: track.title.clone(),
             artist: track.performer.clone(),
             album: album.to_string(),
@@ -221,10 +249,26 @@ pub fn merge_titles(binary: &[CueTrack], text: &[CueTrack]) -> Vec<CueTrack> {
                 if !named.performer.is_empty() {
                     track.performer = named.performer.clone();
                 }
+                if named.disc != 0 {
+                    track.disc = named.disc;
+                }
             }
             track
         })
         .collect()
+}
+
+/// First number of a cue disc tag. `1`, `01`, `"2"`, and `3/5` all yield the disc.
+/// Zero is not a disc number.
+fn parse_disc_number(token: &str) -> Option<u32> {
+    let token = unquote(token);
+    let head = token.split(['/', ' ']).next()?.trim();
+    let number = head.parse::<u32>().ok()?;
+    if number == 0 {
+        None
+    } else {
+        Some(number)
+    }
 }
 
 fn parse_index_time(stamp: &str, sample_rate: u32) -> Option<u64> {
@@ -351,12 +395,14 @@ FILE "b.flac" WAVE
     fn binary_offsets_keep_text_titles() {
         let binary = vec![CueTrack {
             number: 2,
+            disc: 0,
             title: "Track 02".into(),
             performer: String::new(),
             start_frame: 44100,
         }];
         let text = vec![CueTrack {
             number: 2,
+            disc: 3,
             title: "Breathe".into(),
             performer: "Pink Floyd".into(),
             start_frame: 0,
@@ -365,5 +411,46 @@ FILE "b.flac" WAVE
         assert_eq!(merged[0].start_frame, 44100);
         assert_eq!(merged[0].title, "Breathe");
         assert_eq!(merged[0].performer, "Pink Floyd");
+        assert_eq!(merged[0].disc, 3);
+    }
+
+    #[test]
+    fn rem_discnumber_labels_the_tracks_that_follow_it() {
+        let text = r#"
+REM DISCNUMBER 1/5
+REM TOTALDISCS 5
+FILE "cd.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "First"
+    INDEX 01 00:00:00
+  TRACK 15 AUDIO
+    TITLE "Last on one"
+    INDEX 01 01:00:00
+REM DISCNUMBER "2"
+  TRACK 01 AUDIO
+    TITLE "Second disc"
+    INDEX 01 02:00:00
+  TRACK 03 AUDIO
+    REM DISKNUMBER 4
+    TITLE "Before its index"
+    INDEX 01 03:00:00
+"#;
+        let tracks = &parse_cue_text(text, 44100).unwrap()[0].tracks;
+        assert_eq!(tracks[0].disc, 1);
+        assert_eq!(tracks[0].number, 1);
+        assert_eq!(tracks[1].disc, 1);
+        assert_eq!(tracks[1].number, 15);
+        assert_eq!(tracks[2].disc, 2);
+        assert_eq!(tracks[3].disc, 4);
+        let plain = r#"
+FILE "one.flac" WAVE
+  TRACK 01 AUDIO
+    TITLE "Only"
+    INDEX 01 00:00:00
+REM DISCNUMBER 0
+"#;
+        let unset = &parse_cue_text(plain, 44100).unwrap()[0].tracks;
+        assert_eq!(unset[0].disc, 0);
+        assert_eq!(unset[0].number, 1);
     }
 }
