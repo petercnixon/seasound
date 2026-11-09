@@ -219,7 +219,18 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     let mut style = (*ctx.style()).clone();
     style.visuals = visuals;
     style.spacing.slider_rail_height = 6.0;
-    ctx.set_style(style);
+    // egui keeps a dark style and a light style, and follows the OS unless told
+    // otherwise. The OS theme arrives on the first frame, after startup has
+    // applied the SeaSound theme, and would swap in the style that was never
+    // touched. Write this theme into both and pin the preference.
+    let style = Arc::new(style);
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
+    ctx.set_theme(if theme.dark {
+        egui::ThemePreference::Dark
+    } else {
+        egui::ThemePreference::Light
+    });
     ctx.data_mut(|data| data.insert_temp(theme_id(), Arc::new(theme.clone())));
 }
 
@@ -310,6 +321,40 @@ mod tests {
         assert_eq!(themes.get("Dark").error.0, Color32::from_rgba_unmultiplied(255, 0, 0, 0x80));
         assert_eq!(themes.errors.len(), 1);
         assert!(themes.errors[0].starts_with("broken.json"), "{:?}", themes.errors);
+    }
+
+    #[test]
+    fn applied_theme_survives_a_different_system_theme() {
+        let ctx = egui::Context::default();
+        let themes = Themes::load(None);
+        let dark = themes.get("Dark").clone();
+        apply(&ctx, &dark);
+        let light = themes.get("Light").clone();
+        run_with_system_theme(&ctx, egui::Theme::Light, &dark);
+        apply(&ctx, &light);
+        run_with_system_theme(&ctx, egui::Theme::Dark, &light);
+    }
+
+    fn run_with_system_theme(ctx: &egui::Context, system: egui::Theme, theme: &Theme) {
+        let mut input = egui::RawInput::default();
+        input.system_theme = Some(system);
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        ));
+        let _ = ctx.run(input, |ctx| {
+            assert_eq!(ctx.style().visuals.panel_fill, theme.panel.0);
+            assert_eq!(ctx.style().visuals.window_fill, theme.background.0);
+            assert_eq!(
+                ctx.theme(),
+                if theme.dark {
+                    egui::Theme::Dark
+                } else {
+                    egui::Theme::Light
+                }
+            );
+            assert_eq!(current(ctx).name, theme.name);
+        });
     }
 
     #[test]

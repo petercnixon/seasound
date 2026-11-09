@@ -8,7 +8,8 @@ pub fn run() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 700.0])
             .with_min_inner_size([720.0, 460.0])
-            .with_title("SeaSound"),
+            .with_title("SeaSound")
+            .with_icon(window_icon()),
         ..Default::default()
     };
     // winit 0.30 does not emit file-drop events on Wayland. XWayland does.
@@ -20,6 +21,18 @@ pub fn run() -> eframe::Result {
         options,
         Box::new(|creation| Ok(Box::new(app::SeaSoundApp::new(creation)))),
     )
+}
+
+fn window_icon() -> eframe::egui::IconData {
+    let image = image::load_from_memory(include_bytes!("../../../icons/seasound-256.png"))
+        .expect("icons/seasound-256.png")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    eframe::egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
 }
 
 fn prefer_x11_when_xwayland_is_available(builder: &mut eframe::EventLoopBuilder<eframe::UserEvent>) {
@@ -74,5 +87,18 @@ fn xwayland_available() -> bool {
     match std::env::var("WINIT_UNIX_BACKEND") {
         Ok(backend) if backend.eq_ignore_ascii_case("wayland") => false,
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_icon_is_a_square_rgba_image() {
+        let icon = window_icon();
+        assert_eq!(icon.width, 256);
+        assert_eq!(icon.height, 256);
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
 }

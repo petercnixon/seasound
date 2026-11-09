@@ -831,11 +831,17 @@ impl SeaSoundApp {
             chosen = Some(self.theme_name.clone());
         }
         if let Some(dir) = &self.themes_dir {
-            ui.label(
-                egui::RichText::new(format!("Add *.json themes to {}", dir.display()))
-                    .size(12.0)
-                    .color(theme::current(ui.ctx()).weak_text.0),
-            );
+            // Menu rows are justified. A wrapped sentence is then stretched across
+            // the row, so this hint is left-aligned and the path is on its own line.
+            let hint = format!("Add *.json themes to\n{}", dir.display());
+            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                ui.set_max_width(320.0);
+                ui.label(
+                    egui::RichText::new(hint)
+                        .size(12.0)
+                        .color(theme::current(ui.ctx()).weak_text.0),
+                );
+            });
         }
         for error in &self.themes.errors {
             ui.colored_label(ui.visuals().error_fg_color, error);
