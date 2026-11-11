@@ -78,6 +78,7 @@ pub struct SeaSoundApp {
     file_headings: bool,
     session: Option<SessionPlayback>,
     settings_open: bool,
+    about_open: bool,
     columns: ColumnLayout,
     themes: Themes,
     themes_dir: Option<PathBuf>,
@@ -372,6 +373,7 @@ impl SeaSoundApp {
             file_headings: settings.file_headings,
             session: settings.session.clone(),
             settings_open: false,
+            about_open: false,
             columns: settings.columns.sanitized(),
             themes,
             themes_dir,
@@ -921,9 +923,16 @@ impl SeaSoundApp {
                 ui.menu_button("Settings", |ui| {
                     if ui.button("Settings…").clicked() {
                         self.settings_open = true;
+                        self.about_open = false;
                         ui.close_menu();
                     }
                     ui.menu_button("Theme", |ui| self.theme_menu(ui));
+                    ui.separator();
+                    if ui.button("About…").clicked() {
+                        self.about_open = true;
+                        self.settings_open = false;
+                        ui.close_menu();
+                    }
                 });
             });
         });
@@ -1053,6 +1062,37 @@ impl SeaSoundApp {
             });
         if shown.should_close() {
             self.settings_open = false;
+        }
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let frame = egui::Frame::window(&ctx.style()).inner_margin(16);
+        let shown = egui::Modal::new(egui::Id::new("about"))
+            .frame(frame)
+            .backdrop_color(egui::Color32::from_black_alpha(160))
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.set_max_width(440.0);
+                ui.label(egui::RichText::new("SeaSound").strong().size(18.0));
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                        .color(theme::current(ui.ctx()).weak_text.0),
+                );
+                ui.add_space(12.0);
+                ui.label("A pure Rust music player.");
+                ui.add_space(8.0);
+                ui.label("SeaSound is a vibe coded app, written entirely with Grok and Claude.");
+                ui.add_space(14.0);
+                if ui.button("Close").clicked() {
+                    self.about_open = false;
+                }
+            });
+        if shown.should_close() {
+            self.about_open = false;
         }
     }
 
@@ -2006,6 +2046,7 @@ impl eframe::App for SeaSoundApp {
         self.transport(ctx);
         self.playlist_panel(ctx);
         self.settings_window(ctx);
+        self.about_window(ctx);
         self.arm_dialog(ctx);
         if self.loading
             || self.cover_lookup.is_some()
