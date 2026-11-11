@@ -3162,6 +3162,7 @@ dependencies = [
  "directories",
  "eframe",
  "image",
+ "libc",
  "rfd",
  "seasound-media",
  "seasound-model",

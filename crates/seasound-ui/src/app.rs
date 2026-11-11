@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::remote::{Mode, RemoteHub};
 
 use directories::ProjectDirs;
 use eframe::egui;
@@ -45,6 +47,9 @@ pub struct SeaSoundApp {
     textures: HashMap<SourceId, egui::TextureHandle>,
     cover_failed: HashSet<SourceId>,
     load_rx: Option<Receiver<LoadEvent>>,
+    remote: RemoteHub,
+    /// Frames left to raise the window after a remote open.
+    raise_window: u8,
     loading: bool,
     /// Files read so far, and how many the playlist names. `total` is 0 when it is not known yet.
     load_progress: Option<(usize, usize)>,
@@ -94,7 +99,10 @@ enum Dialog {
 }
 
 enum LoadWork {
-    Paths { paths: Vec<PathBuf>, import: Import },
+    Paths {
+        paths: Vec<PathBuf>,
+        import: Import,
+    },
     /// `restore_position` plays the saved place. Startup leaves it off so a fallback
     /// file still loads without starting playback.
     SavedFile {
@@ -113,13 +121,19 @@ enum LoadEvent {
         position: SavedPosition,
     },
     /// One probed file. The first of these onto an empty playlist starts playback.
-    Source { source: Source, import: Import },
+    Source {
+        source: Source,
+        import: Import,
+    },
     /// Rows read so far. The track already playing keeps its decoder.
     Extend {
         playlist: Playlist,
         path: Option<PathBuf>,
     },
-    Progress { done: usize, total: usize },
+    Progress {
+        done: usize,
+        total: usize,
+    },
     /// Every file has been reported. The playlist is already in the window.
     Settled,
     Finished(LoadDone),
@@ -132,7 +146,10 @@ enum LoadDone {
         path: PathBuf,
         position: Option<SavedPosition>,
     },
-    Session { playlist: Playlist, session: SessionPlayback },
+    Session {
+        playlist: Playlist,
+        session: SessionPlayback,
+    },
 }
 
 #[derive(Clone)]
@@ -263,10 +280,15 @@ enum StartupLoad {
     Empty,
 }
 
+pub(crate) fn config_dir() -> Option<PathBuf> {
+    ProjectDirs::from("audio", "SeaSound", "SeaSound").map(|dirs| dirs.config_dir().to_path_buf())
+}
+
 impl SeaSoundApp {
-    pub fn new(creation: &eframe::CreationContext<'_>) -> Self {
-        let config_dir = ProjectDirs::from("audio", "SeaSound", "SeaSound")
-            .map(|dirs| dirs.config_dir().to_path_buf());
+    pub fn new(creation: &eframe::CreationContext<'_>, remote: RemoteHub) -> Self {
+        remote.install_context(&creation.egui_ctx);
+        let opening_files = remote.replaces_playlist();
+        let config_dir = config_dir();
         if let Some(dir) = &config_dir {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -288,6 +310,11 @@ impl SeaSoundApp {
         }
         let extra_dirs: Vec<PathBuf> = plugin_dir.into_iter().collect();
         seasound_media::install_plugins(&extra_dirs, &settings.disabled_plugins);
+        if remote.is_listening() {
+            if let Ok(exe) = std::env::current_exe() {
+                crate::integrate::install(&exe, &seasound_media::plugin_extensions());
+            }
+        }
         let plugins = seasound_media::plugin_statuses();
         let engine = Engine::start(opener());
         engine.command(Command::SetVolume(volume));
@@ -312,6 +339,8 @@ impl SeaSoundApp {
             textures: HashMap::new(),
             cover_failed: HashSet::new(),
             load_rx: None,
+            remote,
+            raise_window: 0,
             loading: false,
             load_progress: None,
             priority_started: false,
@@ -337,29 +366,42 @@ impl SeaSoundApp {
             themes_dir,
             theme_name: settings.theme.clone(),
         };
-        match startup_load(settings.resume_playback, settings.session, settings.playlist) {
-            StartupLoad::Session(session) => {
-                // Rows come from the session. The playlist path stays attached so a later
-                // switch or exit still writes this place back to that file.
-                app.spawn(LoadWork::Session(session));
+        if !opening_files {
+            match startup_load(
+                settings.resume_playback,
+                settings.session,
+                settings.playlist,
+            ) {
+                StartupLoad::Session(session) => {
+                    // Rows come from the session. The playlist path stays attached so a later
+                    // switch or exit still writes this place back to that file.
+                    app.spawn(LoadWork::Session(session));
+                }
+                StartupLoad::File(path) => app.spawn(LoadWork::SavedFile {
+                    path,
+                    restore_position: false,
+                }),
+                StartupLoad::Empty => {}
             }
-            StartupLoad::File(path) => app.spawn(LoadWork::SavedFile {
-                path,
-                restore_position: false,
-            }),
-            StartupLoad::Empty => {}
         }
         app
     }
 
     fn spawn(&mut self, work: LoadWork) {
         let replacing = match &work {
-            LoadWork::Paths { import: Import::Replace, .. } | LoadWork::SavedFile { .. } => {
+            LoadWork::Paths {
+                import: Import::Replace,
+                ..
+            }
+            | LoadWork::SavedFile { .. } => {
                 self.playlist_path = None;
                 true
             }
             LoadWork::Session(_) => true,
-            LoadWork::Paths { import: Import::Append, .. } => false,
+            LoadWork::Paths {
+                import: Import::Append,
+                ..
+            } => false,
         };
         if replacing {
             // The previous list stays out of the way while the new one is read.
@@ -600,6 +642,45 @@ impl SeaSoundApp {
         }
     }
 
+    fn poll_remote(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if let Some(batch) = self.remote.poll(now, self.loading) {
+            if batch.raise() {
+                self.raise_window = 3;
+            }
+            self.import_paths(batch.mode, batch.paths);
+        }
+        if self.raise_window > 0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.raise_window -= 1;
+        }
+    }
+
+    fn import_paths(&mut self, mode: Mode, paths: Vec<PathBuf>) {
+        match mode {
+            Mode::Open => {
+                self.snap = self.engine.snapshot();
+                // A cold open has not loaded the saved rows. Flushing here would
+                // replace that playlist file with an empty list. Quit already wrote it.
+                if !self.snap.rows.is_empty() {
+                    self.flush_open_playlist();
+                }
+                self.spawn(LoadWork::Paths {
+                    paths,
+                    import: Import::Replace,
+                });
+            }
+            Mode::Enqueue => {
+                self.spawn(LoadWork::Paths {
+                    paths,
+                    import: Import::Append,
+                });
+            }
+        }
+    }
+
     fn handle_keys(&mut self, ctx: &egui::Context) {
         if consume(ctx, egui::Key::Space) {
             self.engine.command(Command::TogglePause);
@@ -632,7 +713,9 @@ impl SeaSoundApp {
         if total == 0 {
             return;
         }
-        let row_rate = current_row(&self.snap).map(|row| row.sample_rate).unwrap_or(0);
+        let row_rate = current_row(&self.snap)
+            .map(|row| row.sample_rate)
+            .unwrap_or(0);
         let rate = if row_rate > 0 {
             row_rate
         } else {
@@ -840,7 +923,10 @@ impl SeaSoundApp {
         let current = self.themes.get(&self.theme_name).name.clone();
         let mut chosen = None;
         for theme in &self.themes.list {
-            if ui.radio(theme.name == current, theme.name.as_str()).clicked() {
+            if ui
+                .radio(theme.name == current, theme.name.as_str())
+                .clicked()
+            {
                 chosen = Some(theme.name.clone());
             }
         }
@@ -945,7 +1031,10 @@ impl SeaSoundApp {
     fn device_list(&mut self, ui: &mut egui::Ui) {
         let devices = self.snap.devices.clone();
         let current = self.snap.device.clone();
-        if ui.selectable_label(self.device_pref.is_none(), "System default").clicked() {
+        if ui
+            .selectable_label(self.device_pref.is_none(), "System default")
+            .clicked()
+        {
             self.device_pref = None;
             self.engine.command(Command::SetDevice(None));
         }
@@ -993,91 +1082,100 @@ impl SeaSoundApp {
                     egui::vec2(main_width, 132.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                    ui.set_min_width(main_width);
-                    let title = row
-                        .as_ref()
-                        .map(|row| row_title(row))
-                        .filter(|title| !title.is_empty())
-                        .unwrap_or_else(|| {
-                            if snap.title.is_empty() {
-                                "Not playing".to_string()
-                            } else {
-                                snap.title.clone()
+                        ui.set_min_width(main_width);
+                        let title = row
+                            .as_ref()
+                            .map(|row| row_title(row))
+                            .filter(|title| !title.is_empty())
+                            .unwrap_or_else(|| {
+                                if snap.title.is_empty() {
+                                    "Not playing".to_string()
+                                } else {
+                                    snap.title.clone()
+                                }
+                            });
+                        ui.label(egui::RichText::new(title).strong().size(18.0));
+                        ui.label(subtitle(row.as_ref(), &snap));
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Prev").clicked() {
+                                self.engine.command(Command::Previous);
+                            }
+                            if ui.button(play_word(snap.state)).clicked() {
+                                self.engine.command(Command::TogglePause);
+                            }
+                            if ui.button("Next").clicked() {
+                                self.engine.command(Command::Next);
+                            }
+                            if ui.button("Stop").clicked() {
+                                self.engine.command(Command::Stop);
+                            }
+                            ui.add_space(8.0);
+                            let repeat =
+                                colored(ui, snap.repeat.label(), snap.repeat != Repeat::Off);
+                            if ui.button(repeat).clicked() {
+                                self.engine.command(Command::SetRepeat(snap.repeat.next()));
+                                self.settle = 10;
+                            }
+                            let shuffle = colored(
+                                ui,
+                                if snap.shuffle {
+                                    "Shuffle on"
+                                } else {
+                                    "Shuffle"
+                                },
+                                snap.shuffle,
+                            );
+                            if ui.button(shuffle).clicked() {
+                                self.engine.command(Command::SetShuffle(!snap.shuffle));
+                                self.settle = 10;
                             }
                         });
-                    ui.label(egui::RichText::new(title).strong().size(18.0));
-                    ui.label(subtitle(row.as_ref(), &snap));
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Prev").clicked() {
-                            self.engine.command(Command::Previous);
-                        }
-                        if ui.button(play_word(snap.state)).clicked() {
-                            self.engine.command(Command::TogglePause);
-                        }
-                        if ui.button("Next").clicked() {
-                            self.engine.command(Command::Next);
-                        }
-                        if ui.button("Stop").clicked() {
-                            self.engine.command(Command::Stop);
-                        }
-                        ui.add_space(8.0);
-                        let repeat = colored(ui, snap.repeat.label(), snap.repeat != Repeat::Off);
-                        if ui.button(repeat).clicked() {
-                            self.engine.command(Command::SetRepeat(snap.repeat.next()));
-                            self.settle = 10;
-                        }
-                        let shuffle = colored(
-                            ui,
-                            if snap.shuffle { "Shuffle on" } else { "Shuffle" },
-                            snap.shuffle,
-                        );
-                        if ui.button(shuffle).clicked() {
-                            self.engine.command(Command::SetShuffle(!snap.shuffle));
-                            self.settle = 10;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let (shown_pos, total_frames, rate) = clock(&snap, row.as_ref(), self.seek, self.seek_drag);
-                        ui.label(format_time(shown_pos, rate));
-                        let end = format_time(total_frames, rate);
-                        let end_width = 56.0;
-                        let slider_width = (ui.available_width() - end_width).max(48.0);
-                        let previous = ui.spacing().slider_width;
-                        ui.spacing_mut().slider_width = slider_width;
-                        let slider = egui::Slider::new(&mut self.seek, 0.0..=1.0)
-                            .show_value(false)
-                            .trailing_fill(true);
-                        let response = ui.add(slider);
-                        ui.spacing_mut().slider_width = previous;
-                        if response.drag_started() || response.dragged() {
-                            self.seek_drag = true;
-                        }
-                        if response.drag_stopped() || response.clicked() {
-                            self.seek_drag = false;
-                            self.seek_sent = true;
-                            self.engine.command(Command::SeekFraction(self.seek));
-                            self.settle = 20;
-                        }
-                        ui.label(end);
-                    });
-                    ui.horizontal(|ui| {
-                        let mute = if self.muted { "Muted" } else { "Volume" };
-                        if ui.button(colored(ui, mute, self.muted)).clicked() {
-                            self.muted = !self.muted;
-                            self.engine.command(Command::SetMuted(self.muted));
-                        }
-                        let slider = egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false);
-                        let previous = ui.spacing().slider_width;
-                        ui.spacing_mut().slider_width = 140.0;
-                        let changed = ui.add(slider).changed();
-                        ui.spacing_mut().slider_width = previous;
-                        if changed {
-                            self.engine.command(Command::SetVolume(self.volume));
-                        }
-                    });
-                });
-                let (rule, _) = ui.allocate_exact_size(egui::vec2(gutter, 112.0), egui::Sense::hover());
+                        ui.horizontal(|ui| {
+                            let (shown_pos, total_frames, rate) =
+                                clock(&snap, row.as_ref(), self.seek, self.seek_drag);
+                            ui.label(format_time(shown_pos, rate));
+                            let end = format_time(total_frames, rate);
+                            let end_width = 56.0;
+                            let slider_width = (ui.available_width() - end_width).max(48.0);
+                            let previous = ui.spacing().slider_width;
+                            ui.spacing_mut().slider_width = slider_width;
+                            let slider = egui::Slider::new(&mut self.seek, 0.0..=1.0)
+                                .show_value(false)
+                                .trailing_fill(true);
+                            let response = ui.add(slider);
+                            ui.spacing_mut().slider_width = previous;
+                            if response.drag_started() || response.dragged() {
+                                self.seek_drag = true;
+                            }
+                            if response.drag_stopped() || response.clicked() {
+                                self.seek_drag = false;
+                                self.seek_sent = true;
+                                self.engine.command(Command::SeekFraction(self.seek));
+                                self.settle = 20;
+                            }
+                            ui.label(end);
+                        });
+                        ui.horizontal(|ui| {
+                            let mute = if self.muted { "Muted" } else { "Volume" };
+                            if ui.button(colored(ui, mute, self.muted)).clicked() {
+                                self.muted = !self.muted;
+                                self.engine.command(Command::SetMuted(self.muted));
+                            }
+                            let slider =
+                                egui::Slider::new(&mut self.volume, 0.0..=1.0).show_value(false);
+                            let previous = ui.spacing().slider_width;
+                            ui.spacing_mut().slider_width = 140.0;
+                            let changed = ui.add(slider).changed();
+                            ui.spacing_mut().slider_width = previous;
+                            if changed {
+                                self.engine.command(Command::SetVolume(self.volume));
+                            }
+                        });
+                    },
+                );
+                let (rule, _) =
+                    ui.allocate_exact_size(egui::vec2(gutter, 112.0), egui::Sense::hover());
                 let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
                 ui.painter().vline(
                     rule.center().x,
@@ -1197,7 +1295,10 @@ impl SeaSoundApp {
                 return;
             }
             if hovering {
-                ui.label(egui::RichText::new("Drop audio to add it").color(ui.visuals().selection.bg_fill));
+                ui.label(
+                    egui::RichText::new("Drop audio to add it")
+                        .color(ui.visuals().selection.bg_fill),
+                );
             }
             if self.loading {
                 ui.label(
@@ -1347,7 +1448,9 @@ impl SeaSoundApp {
 
         if down {
             let icon = match drag.gesture {
-                RowGesture::Move { .. } if drag.travel > DRAG_SLOP => Some(egui::CursorIcon::Grabbing),
+                RowGesture::Move { .. } if drag.travel > DRAG_SLOP => {
+                    Some(egui::CursorIcon::Grabbing)
+                }
                 RowGesture::Move { .. } => hover_cursor(&self.selected, rows, slots, bar_inset),
                 RowGesture::Select { .. } => None,
             };
@@ -1377,7 +1480,8 @@ impl SeaSoundApp {
         };
         let mut indices: Vec<usize> = self.selected.iter().copied().collect();
         indices.sort_unstable();
-        let Some(places) = Playlist::moved_places(playlist_len(rows), &indices, insert_before) else {
+        let Some(places) = Playlist::moved_places(playlist_len(rows), &indices, insert_before)
+        else {
             return;
         };
         self.engine.command(Command::MoveRows {
@@ -1419,12 +1523,16 @@ impl SeaSoundApp {
                 let moving = self.row_drag.is_some_and(|drag| {
                     drag.travel > DRAG_SLOP && matches!(drag.gesture, RowGesture::Move { .. })
                 });
-                let highlight = row_highlight(&theme, playing, selected, pointer_on_row(slot, bar_inset));
+                let highlight =
+                    row_highlight(&theme, playing, selected, pointer_on_row(slot, bar_inset));
                 if let Some((fill, _)) = highlight {
                     ui.painter().rect_filled(rect, 0.0, fill);
                 }
                 if playing {
-                    let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 3.0, rect.bottom()));
+                    let bar = egui::Rect::from_min_max(
+                        rect.min,
+                        egui::pos2(rect.left() + 3.0, rect.bottom()),
+                    );
                     ui.painter().rect_filled(bar, 0.0, theme.background.0);
                 }
                 if moving && selected {
@@ -1493,7 +1601,11 @@ impl SeaSoundApp {
         paint_insertion_line(ui.painter(), accent, slot.rect.left(), slot.rect.right(), y);
     }
 
-    fn autoscroll<R>(&self, ctx: &egui::Context, output: &egui::containers::scroll_area::ScrollAreaOutput<R>) {
+    fn autoscroll<R>(
+        &self,
+        ctx: &egui::Context,
+        output: &egui::containers::scroll_area::ScrollAreaOutput<R>,
+    ) {
         let Some(drag) = self.row_drag else {
             return;
         };
@@ -1820,6 +1932,7 @@ impl eframe::App for SeaSoundApp {
             self.persist();
         }
         self.poll_load();
+        self.poll_remote(ctx);
         self.poll_cover();
         self.request_playing_cover();
         self.take_drops(ctx);
@@ -1836,6 +1949,8 @@ impl eframe::App for SeaSoundApp {
             || self.settle > 0
             || self.dialog.is_some()
             || self.row_drag.is_some()
+            || self.remote.waiting()
+            || self.raise_window > 0
         {
             if self.settle > 0 {
                 self.settle -= 1;
@@ -1934,10 +2049,7 @@ fn early_file(paths: &[PathBuf], position: Option<&SavedPosition>) -> Option<Pat
         return None;
     }
     let position = position?;
-    paths
-        .iter()
-        .find(|path| *path == &position.path)
-        .cloned()
+    paths.iter().find(|path| *path == &position.path).cloned()
 }
 
 fn distinct_paths(rows: &[SavedRow]) -> Vec<PathBuf> {
@@ -2102,12 +2214,7 @@ fn resume_start(playlist: &Playlist, track: &SavedPosition) -> Option<StartAt> {
 /// A probe already stored the image, or stored that there is none. A playlist
 /// rebuilt from saved rows has neither, so the file that is playing is opened
 /// for the picture alone. `busy` keeps that to one file at a time.
-fn needs_cover_read(
-    id: SourceId,
-    known: &HashSet<SourceId>,
-    have_bytes: bool,
-    busy: bool,
-) -> bool {
+fn needs_cover_read(id: SourceId, known: &HashSet<SourceId>, have_bytes: bool, busy: bool) -> bool {
     !busy && !have_bytes && !known.contains(&id)
 }
 
@@ -2252,7 +2359,8 @@ fn hover_cursor(
         let Line::Track(position) = &slot.line else {
             return false;
         };
-        rows.get(*position).is_some_and(|row| selected.contains(&row.index))
+        rows.get(*position)
+            .is_some_and(|row| selected.contains(&row.index))
     });
     if hover {
         Some(egui::CursorIcon::Grab)
@@ -2355,7 +2463,13 @@ fn ghost_text(rows: &[RowView], selected: &HashSet<usize>) -> String {
     }
 }
 
-fn paint_insertion_line(painter: &egui::Painter, accent: egui::Color32, left: f32, right: f32, y: f32) {
+fn paint_insertion_line(
+    painter: &egui::Painter,
+    accent: egui::Color32,
+    left: f32,
+    right: f32,
+    y: f32,
+) {
     let line = egui::Rect::from_min_max(egui::pos2(left, y - 1.0), egui::pos2(right, y + 1.0));
     painter.rect_filled(line, 0.0, accent);
     let nub = egui::Rect::from_min_max(egui::pos2(left, y - 5.0), egui::pos2(left + 8.0, y + 5.0));
@@ -2373,8 +2487,17 @@ fn paint_ghost(ctx: &egui::Context, pointer: egui::Pos2, label: &str) {
     let origin = pointer + egui::vec2(14.0, 16.0);
     let rect = egui::Rect::from_min_size(origin, galley.size() + pad * 2.0);
     let [r, g, b, _] = theme.panel.0.to_array();
-    painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(r, g, b, 235));
-    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, theme.accent.0), egui::StrokeKind::Inside);
+    painter.rect_filled(
+        rect,
+        4.0,
+        egui::Color32::from_rgba_unmultiplied(r, g, b, 235),
+    );
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, theme.accent.0),
+        egui::StrokeKind::Inside,
+    );
     painter.galley(rect.min + pad, galley, text);
 }
 
@@ -2410,7 +2533,9 @@ fn playlist_lines(rows: &[RowView]) -> Vec<Line> {
 
 fn line_of(lines: &[Line], rows: &[RowView], entry_index: usize) -> Option<usize> {
     lines.iter().position(|line| match line {
-        Line::Track(position) => rows.get(*position).is_some_and(|row| row.index == entry_index),
+        Line::Track(position) => rows
+            .get(*position)
+            .is_some_and(|row| row.index == entry_index),
         Line::Header(_) => false,
     })
 }
@@ -2440,13 +2565,7 @@ fn file_details(ui: &mut egui::Ui, row: Option<&RowView>, rows: &[RowView]) {
             format_channels(row.channels),
             format_bit_depth(row.bits_per_sample),
         ),
-        None => (
-            em_dash(),
-            em_dash(),
-            em_dash(),
-            em_dash(),
-            em_dash(),
-        ),
+        None => (em_dash(), em_dash(), em_dash(), em_dash(), em_dash()),
     };
     let playtime = playlist_playtime(rows);
     ui.add_space(2.0);
@@ -2486,7 +2605,11 @@ fn playlist_playtime(rows: &[RowView]) -> String {
 fn detail_line(ui: &mut egui::Ui, label: &str, value: &str) {
     let weak = theme::current(ui.ctx()).weak_text.0;
     ui.label(egui::RichText::new(label).color(weak).size(13.0));
-    let value_color = if value == "—" { weak } else { ui.visuals().text_color() };
+    let value_color = if value == "—" {
+        weak
+    } else {
+        ui.visuals().text_color()
+    };
     ui.label(egui::RichText::new(value).color(value_color).size(13.0));
     ui.end_row();
 }
@@ -2562,8 +2685,12 @@ fn format_bit_depth(bits: u16) -> String {
 }
 
 fn subtitle(row: Option<&RowView>, snap: &Snapshot) -> String {
-    let artist = row.map(|row| row.artist.as_str()).unwrap_or(snap.artist.as_str());
-    let album = row.map(|row| row.album.as_str()).unwrap_or(snap.album.as_str());
+    let artist = row
+        .map(|row| row.artist.as_str())
+        .unwrap_or(snap.artist.as_str());
+    let album = row
+        .map(|row| row.album.as_str())
+        .unwrap_or(snap.album.as_str());
     match (artist.is_empty(), album.is_empty()) {
         (true, true) => String::new(),
         (false, true) => artist.to_string(),
@@ -2606,7 +2733,6 @@ fn colored(ui: &egui::Ui, text: &str, active: bool) -> egui::RichText {
 fn consume(ctx: &egui::Context, key: egui::Key) -> bool {
     ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key))
 }
-
 
 const COLUMN_PAD: f32 = 8.0;
 const MIN_NUMBER: f32 = 24.0;
@@ -2717,7 +2843,11 @@ impl ColumnLayout {
             artist: fix(self.artist, MIN_TEXT, default_text_width()),
             album: fix(self.album, MIN_TEXT, default_text_width()),
             time: fix(self.time, MIN_TIME, default_time_width()),
-            order: if complete { self.order } else { default_column_order() },
+            order: if complete {
+                self.order
+            } else {
+                default_column_order()
+            },
         }
     }
 
@@ -2762,7 +2892,13 @@ impl ColumnLayout {
         let title = (avail - used).max(0.0);
         self.order
             .iter()
-            .map(|&kind| if kind == ColumnKind::Title { title } else { shrunk(kind) })
+            .map(|&kind| {
+                if kind == ColumnKind::Title {
+                    title
+                } else {
+                    shrunk(kind)
+                }
+            })
             .collect()
     }
 
@@ -2773,7 +2909,10 @@ impl ColumnLayout {
         let (Some(&left), Some(&right)) = (self.order.get(index), self.order.get(index + 1)) else {
             return;
         };
-        let title_at = self.order.iter().position(|&kind| kind == ColumnKind::Title);
+        let title_at = self
+            .order
+            .iter()
+            .position(|&kind| kind == ColumnKind::Title);
         let title = title_at.map_or(0.0, |at| self.fit(width)[at]);
         let title_room = (title - MIN_TITLE).max(0.0);
         let lo;
@@ -2891,10 +3030,18 @@ fn column_header(ui: &mut egui::Ui, layout: &mut ColumnLayout) -> bool {
     for (index, &(kind, column)) in columns.iter().enumerate() {
         let lifted = moving.is_some_and(|(from, _)| from == index);
         if lifted {
-            ui.painter().rect_filled(column, 2.0, accent.gamma_multiply(0.18));
+            ui.painter()
+                .rect_filled(column, 2.0, accent.gamma_multiply(0.18));
         }
         let color = if lifted { accent } else { weak };
-        paint_text(ui, column, kind.label(), color, false, egui::Align2::LEFT_CENTER);
+        paint_text(
+            ui,
+            column,
+            kind.label(),
+            color,
+            false,
+            egui::Align2::LEFT_CENTER,
+        );
     }
 
     for index in 0..columns.len().saturating_sub(1) {
@@ -2904,9 +3051,11 @@ fn column_header(ui: &mut egui::Ui, layout: &mut ColumnLayout) -> bool {
             egui::pos2(x + DIVIDER_GRAB, rect.bottom()),
         );
         // Keyed by the columns on both sides, so a reorder does not inherit a drag.
-        let id = ui
-            .id()
-            .with(("column_divider", columns[index].0 as u8, columns[index + 1].0 as u8));
+        let id = ui.id().with((
+            "column_divider",
+            columns[index].0 as u8,
+            columns[index + 1].0 as u8,
+        ));
         let response = ui
             .interact(grab, id, egui::Sense::click_and_drag())
             .on_hover_cursor(egui::CursorIcon::ResizeColumn);
@@ -2941,8 +3090,11 @@ fn column_header(ui: &mut egui::Ui, layout: &mut ColumnLayout) -> bool {
             } else {
                 columns[gap - 1].1.right()
             };
-            ui.painter()
-                .vline(x, egui::Rangef::new(rect.top(), rect.bottom()), egui::Stroke::new(3.0, accent));
+            ui.painter().vline(
+                x,
+                egui::Rangef::new(rect.top(), rect.bottom()),
+                egui::Stroke::new(3.0, accent),
+            );
         }
     }
     if let Some((from, gap)) = dropped {
@@ -2979,7 +3131,9 @@ fn paint_text(
         egui::Align2::RIGHT_CENTER => rect.right_center() - egui::vec2(6.0, 0.0),
         _ => rect.left_center() + egui::vec2(4.0, 0.0),
     };
-    ui.painter().with_clip_rect(rect).text(anchor, align, text, font, color);
+    ui.painter()
+        .with_clip_rect(rect)
+        .text(anchor, align, text, font, color);
 }
 
 fn load_settings(path: &Path) -> Settings {
@@ -3051,7 +3205,10 @@ mod tests {
         assert_eq!(format_bit_depth(0), "—");
         assert_eq!(codec_label("FLAC", Path::new("album.flac")), "FLAC");
         assert_eq!(codec_label("AAC", Path::new("book.m4a")), "AAC · M4A");
-        assert_eq!(codec_label("Vorbis", Path::new("track.ogg")), "Vorbis · OGG");
+        assert_eq!(
+            codec_label("Vorbis", Path::new("track.ogg")),
+            "Vorbis · OGG"
+        );
         assert_eq!(codec_label("WavPack", Path::new("tape.wv")), "WavPack · WV");
         assert_eq!(codec_label("AIFF", Path::new("take.aif")), "AIFF");
         assert_eq!(codec_label("Audio", Path::new("mystery.wv")), "WV");
@@ -3082,12 +3239,18 @@ mod tests {
         let themes = Themes::load(None);
         let theme = themes.get(theme::DEFAULT_THEME);
         let pair = |fill: theme::Hex, text: theme::Hex| Some((fill.0, text.0));
-        assert_eq!(row_highlight(theme, true, true, true), pair(theme.accent, theme.accent_text));
+        assert_eq!(
+            row_highlight(theme, true, true, true),
+            pair(theme.accent, theme.accent_text)
+        );
         assert_eq!(
             row_highlight(theme, false, true, true),
             pair(theme.row_selected, theme.row_selected_text)
         );
-        assert_eq!(row_highlight(theme, false, false, true), pair(theme.row_hover, theme.row_hover_text));
+        assert_eq!(
+            row_highlight(theme, false, false, true),
+            pair(theme.row_hover, theme.row_hover_text)
+        );
         assert_eq!(row_highlight(theme, false, false, false), None);
     }
 
@@ -3223,7 +3386,9 @@ mod tests {
             restore_position: false,
         }) {
             LoadDone::Saved { position: None, .. } => {}
-            LoadDone::Saved { position: Some(_), .. } => panic!("startup used the position"),
+            LoadDone::Saved {
+                position: Some(_), ..
+            } => panic!("startup used the position"),
             LoadDone::Session { .. } => panic!("wrong load"),
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -3305,10 +3470,9 @@ mod tests {
             .collect();
         assert_eq!(paths, vec![first, second]);
         assert!(matches!(events.last(), Some(LoadEvent::Settled)));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            LoadEvent::Progress { done: 1, total: 0 }
-        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, LoadEvent::Progress { done: 1, total: 0 })));
     }
 
     #[test]
@@ -3397,7 +3561,10 @@ mod tests {
         assert!(!row_hit_rect(row, gutter).contains(egui::pos2(191.0, 10.0)));
         assert_eq!(vertical_bar_inset(true, 200.0, 400.0, 10.0, 0.0), 0.0);
         assert!(row_hit_rect(row, 0.0).contains(egui::pos2(199.0, 10.0)));
-        assert_eq!(vertical_bar_inset(false, 30.0 * ROW_H, 400.0, 10.0, 4.0), 0.0);
+        assert_eq!(
+            vertical_bar_inset(false, 30.0 * ROW_H, 400.0, 10.0, 4.0),
+            0.0
+        );
     }
 
     #[test]
@@ -3707,7 +3874,10 @@ mod tests {
             let after = right_edges(&moved);
             for (edge, (a, b)) in after.iter().zip(&before).enumerate() {
                 let expected = if edge == divider { b + 12.0 } else { *b };
-                assert!((a - expected).abs() < 0.01, "divider {divider} edge {edge}: {a} vs {expected}");
+                assert!(
+                    (a - expected).abs() < 0.01,
+                    "divider {divider} edge {edge}: {a} vs {expected}"
+                );
             }
         }
     }
@@ -3772,7 +3942,8 @@ mod tests {
             },
             ..Settings::default()
         };
-        let back: Settings = serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
+        let back: Settings =
+            serde_json::from_str(&serde_json::to_string(&stored).unwrap()).unwrap();
         assert_eq!(back.columns, stored.columns);
         let bad = ColumnLayout {
             number: f32::NAN,
@@ -3785,7 +3956,8 @@ mod tests {
         assert_eq!(bad.artist, MIN_TEXT);
         assert_eq!(bad.order, default_column_order());
         let old: Settings =
-            serde_json::from_str(r#"{"columns":{"number":30,"artist":100,"album":100,"time":60}}"#).unwrap();
+            serde_json::from_str(r#"{"columns":{"number":30,"artist":100,"album":100,"time":60}}"#)
+                .unwrap();
         assert_eq!(old.columns.order, default_column_order());
         assert_eq!(old.columns.number, 30.0);
     }

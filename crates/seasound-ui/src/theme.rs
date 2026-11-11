@@ -64,9 +64,9 @@ pub struct Hex(pub Color32);
 impl<'de> Deserialize<'de> for Hex {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
-        parse_hex(&text)
-            .map(Hex)
-            .ok_or_else(|| serde::de::Error::custom(format!("`{text}` is not #rrggbb or #rrggbbaa")))
+        parse_hex(&text).map(Hex).ok_or_else(|| {
+            serde::de::Error::custom(format!("`{text}` is not #rrggbb or #rrggbbaa"))
+        })
     }
 }
 
@@ -77,11 +77,19 @@ fn parse_hex(text: &str) -> Option<Color32> {
     }
     let byte = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).ok();
     let alpha = if digits.len() == 8 { byte(6)? } else { 255 };
-    Some(Color32::from_rgba_unmultiplied(byte(0)?, byte(2)?, byte(4)?, alpha))
+    Some(Color32::from_rgba_unmultiplied(
+        byte(0)?,
+        byte(2)?,
+        byte(4)?,
+        alpha,
+    ))
 }
 
 fn base_is_dark<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
-    match String::deserialize(deserializer)?.to_ascii_lowercase().as_str() {
+    match String::deserialize(deserializer)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "dark" => Ok(true),
         "light" => Ok(false),
         other => Err(serde::de::Error::custom(format!(
@@ -112,7 +120,10 @@ impl Themes {
                 .and_then(|text| parse_theme(&text));
             match parsed {
                 Ok(theme) => {
-                    match list.iter_mut().find(|item| item.name.eq_ignore_ascii_case(&theme.name)) {
+                    match list
+                        .iter_mut()
+                        .find(|item| item.name.eq_ignore_ascii_case(&theme.name))
+                    {
                         Some(slot) => *slot = theme,
                         None => list.push(theme),
                     }
@@ -131,7 +142,11 @@ impl Themes {
         self.list
             .iter()
             .find(|theme| theme.name.eq_ignore_ascii_case(name))
-            .or_else(|| self.list.iter().find(|theme| theme.name.eq_ignore_ascii_case(DEFAULT_THEME)))
+            .or_else(|| {
+                self.list
+                    .iter()
+                    .find(|theme| theme.name.eq_ignore_ascii_case(DEFAULT_THEME))
+            })
             .unwrap_or(&self.list[0])
     }
 }
@@ -207,10 +222,30 @@ pub fn apply(ctx: &egui::Context, theme: &Theme) {
     widgets.noninteractive.bg_stroke.color = theme.border.0;
     widgets.noninteractive.fg_stroke.color = theme.text.0;
     for (state, fill, button, text) in [
-        (&mut widgets.inactive, theme.control, theme.button, theme.control_text),
-        (&mut widgets.hovered, theme.control_hover, theme.button_hover, theme.control_text_hover),
-        (&mut widgets.active, theme.control_active, theme.button_active, theme.control_text_hover),
-        (&mut widgets.open, theme.control_hover, theme.button_hover, theme.control_text_hover),
+        (
+            &mut widgets.inactive,
+            theme.control,
+            theme.button,
+            theme.control_text,
+        ),
+        (
+            &mut widgets.hovered,
+            theme.control_hover,
+            theme.button_hover,
+            theme.control_text_hover,
+        ),
+        (
+            &mut widgets.active,
+            theme.control_active,
+            theme.button_active,
+            theme.control_text_hover,
+        ),
+        (
+            &mut widgets.open,
+            theme.control_hover,
+            theme.button_hover,
+            theme.control_text_hover,
+        ),
     ] {
         state.bg_fill = fill.0;
         state.weak_bg_fill = button.0;
@@ -308,8 +343,16 @@ mod tests {
             r##"{"name": "Mint", "base": "light", "accent": "#2e8b57"}"##,
         )
         .unwrap();
-        std::fs::write(dir.join("dark.json"), r##"{"name": "dark", "error": "#ff000080"}"##).unwrap();
-        std::fs::write(dir.join("broken.json"), r##"{"name": "Bad", "accent": "teal"}"##).unwrap();
+        std::fs::write(
+            dir.join("dark.json"),
+            r##"{"name": "dark", "error": "#ff000080"}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("broken.json"),
+            r##"{"name": "Bad", "accent": "teal"}"##,
+        )
+        .unwrap();
         let themes = Themes::load(Some(&dir));
         let _ = std::fs::remove_dir_all(&dir);
         let light = themes.get("Light").clone();
@@ -318,9 +361,16 @@ mod tests {
         assert_eq!(mint.accent.0, Color32::from_rgb(0x2e, 0x8b, 0x57));
         assert_eq!(mint.background, light.background);
         assert_eq!(themes.list.len(), 4);
-        assert_eq!(themes.get("Dark").error.0, Color32::from_rgba_unmultiplied(255, 0, 0, 0x80));
+        assert_eq!(
+            themes.get("Dark").error.0,
+            Color32::from_rgba_unmultiplied(255, 0, 0, 0x80)
+        );
         assert_eq!(themes.errors.len(), 1);
-        assert!(themes.errors[0].starts_with("broken.json"), "{:?}", themes.errors);
+        assert!(
+            themes.errors[0].starts_with("broken.json"),
+            "{:?}",
+            themes.errors
+        );
     }
 
     #[test]
@@ -359,7 +409,10 @@ mod tests {
 
     #[test]
     fn hex_colours_need_a_hash_and_six_or_eight_digits() {
-        assert_eq!(parse_hex("#0e1418"), Some(Color32::from_rgb(0x0e, 0x14, 0x18)));
+        assert_eq!(
+            parse_hex("#0e1418"),
+            Some(Color32::from_rgb(0x0e, 0x14, 0x18))
+        );
         assert_eq!(parse_hex("#FFFFFF"), Some(Color32::WHITE));
         assert_eq!(parse_hex("0e1418"), None);
         assert_eq!(parse_hex("#fff"), None);
