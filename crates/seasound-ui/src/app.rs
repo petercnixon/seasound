@@ -1010,7 +1010,7 @@ impl SeaSoundApp {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "On exit, SeaSound saves the playlist in the app, the current track, and the position. The next launch plays that track from the saved position. This is the playlist in the window, not a playlist file you opened. Save playlist stores that same place in the file. Open playlist plays the file from there when this is on.",
+                        "On exit, SeaSound saves the playlist in the app, the current track, and the position. The next launch plays that track from the saved position. A track that fails to open does not replace that place. This is the playlist in the window, not a playlist file you opened. Save playlist stores that same place in the file. Open playlist plays the file from there when this is on.",
                     )
                     .size(13.0)
                     .color(theme::current(ui.ctx()).weak_text.0),
@@ -2371,12 +2371,26 @@ fn saved_playlist(rows: &[RowView], position: Option<SavedPosition>) -> SavedPla
 }
 
 fn playback_position(snap: &Snapshot) -> Option<SavedPosition> {
+    // The held place survives a failed open. The cursor may already be on a
+    // later row that never played.
+    if let Some(position) = position_at(snap, snap.last_played_index, snap.last_played_frames) {
+        return Some(position);
+    }
     let index = snap.index?;
+    let row = snap.rows.get(index)?;
+    if row.error.is_some() {
+        return None;
+    }
+    position_at(snap, Some(index), snap.position_frames)
+}
+
+fn position_at(snap: &Snapshot, index: Option<usize>, frames: u64) -> Option<SavedPosition> {
+    let index = index?;
     let row = snap.rows.get(index)?;
     Some(SavedPosition {
         path: row.path.clone(),
         start_frame: row.start_frame,
-        position_frames: snap.position_frames,
+        position_frames: frames,
     })
 }
 
@@ -3504,6 +3518,28 @@ mod tests {
         };
         assert_eq!(playback_position(&snap), back.position);
         assert!(playback_position(&Snapshot::default()).is_none());
+    }
+
+    #[test]
+    fn a_failed_row_does_not_replace_the_last_played_place() {
+        let mut failed = row(1, None, 0, "Missing");
+        failed.path = PathBuf::from("/net/missing.mp3");
+        failed.error = Some("network is not up".into());
+        let kept = row(0, None, 88200, "On the Run");
+        let snap = Snapshot {
+            state: PlayState::Stopped,
+            index: Some(1),
+            position_frames: 0,
+            rows: std::sync::Arc::new(vec![kept, failed]),
+            error: Some("network is not up".into()),
+            last_played_index: Some(0),
+            last_played_frames: 1000,
+            ..Snapshot::default()
+        };
+        let position = playback_position(&snap).expect("place");
+        assert_eq!(position.path, PathBuf::from("/music/album.flac"));
+        assert_eq!(position.start_frame, 88200);
+        assert_eq!(position.position_frames, 1000);
     }
 
     #[test]

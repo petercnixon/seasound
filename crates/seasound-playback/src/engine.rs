@@ -34,6 +34,11 @@ pub struct Snapshot {
     pub error: Option<String>,
     pub device: String,
     pub devices: Arc<Vec<String>>,
+    /// Row that last produced audio, or the place playback was asked to resume.
+    /// A file that fails to open does not move this.
+    pub last_played_index: Option<usize>,
+    /// Frames into that row. Zero when `last_played_index` is absent.
+    pub last_played_frames: u64,
 }
 
 impl Default for Snapshot {
@@ -55,6 +60,8 @@ impl Default for Snapshot {
             error: None,
             device: String::new(),
             devices: Arc::new(Vec::new()),
+            last_played_index: None,
+            last_played_frames: 0,
         }
     }
 }
@@ -197,6 +204,7 @@ fn playback_thread(
         display_index: None,
         seek_frame: None,
         device_played: output.played(),
+        anchor: None,
     };
     output.set_gain(deck.gain());
     let mut buffer = vec![0f32; 2048 * 2];
@@ -238,7 +246,12 @@ fn playback_thread(
                 }
                 match deck.fill(&mut buffer[..samples]) {
                     Ok(Fill { frames: 0, waiting: true }) => thread::sleep(Duration::from_millis(2)),
-                    Ok(Fill { frames: 0, waiting: false }) => deck.state = PlayState::Stopped,
+                    Ok(Fill { frames: 0, waiting: false }) => {
+                        // The cursor has walked onto files that did not open.
+                        // Put it back so Play, Next, and the highlight agree.
+                        deck.park_on_held();
+                        deck.state = PlayState::Stopped;
+                    }
                     Ok(Fill { frames, .. }) => {
                         let accepted = output.push(&buffer[..frames * 2]);
                         if accepted > 0 {
@@ -252,6 +265,7 @@ fn playback_thread(
                 }
             }
         }
+        deck.note_located();
         publish(&deck, &*output, &published);
     }
 }
@@ -315,10 +329,14 @@ fn handle(deck: &mut Deck, output: &mut dyn AudioOut, command: Command) -> bool 
                 output.set_paused(false);
             }
             PlayState::Stopped => {
-                let index = deck.cursor.index().or_else(|| deck.first_playable());
-                if let Some(index) = index {
-                    let _ = deck.reopen(index, true);
-                    deck.begin(index, output);
+                // The controls stay on the place that played. Play tries that
+                // frame again. A stop with no failure still starts the row over.
+                if !deck.play_held(output) {
+                    let index = deck.cursor.index().or_else(|| deck.first_playable());
+                    if let Some(index) = index {
+                        let _ = deck.reopen(index, true);
+                        deck.begin(index, output);
+                    }
                 }
             }
         },
@@ -520,6 +538,15 @@ struct Deck {
     display_index: Option<usize>,
     seek_frame: Option<u64>,
     device_played: u64,
+    /// Last place that played, or the place a playlist was started from.
+    /// Kept by source and segment so a reorder does not drop it.
+    anchor: Option<Anchor>,
+}
+
+struct Anchor {
+    source_id: SourceId,
+    segment: usize,
+    position_frames: u64,
 }
 
 impl Deck {
@@ -578,6 +605,7 @@ impl Deck {
         self.gave_up.clear();
         self.pending_retry = None;
         self.inflight = None;
+        self.anchor = None;
     }
 
     /// Stop the audible stream and forget the open decoder.
@@ -667,6 +695,18 @@ impl Deck {
 
     /// The retried file opened. Other rows that failed the same way can load too.
     fn note_recovered(&mut self, id: SourceId) {
+        // The row that is actually open becomes the current one. A failed open
+        // never gets here, so the highlight stays on the last file that did.
+        if let Some(index) = self.cursor.index() {
+            let current = self
+                .playlist
+                .entries
+                .get(index)
+                .is_some_and(|entry| entry.source_id == id);
+            if current {
+                self.display_index = Some(index);
+            }
+        }
         let recovered = self.pending_retry == Some(id);
         self.gave_up.clear();
         if !recovered {
@@ -765,6 +805,116 @@ impl Deck {
         // frame on that attempt would start at the cue point. A paused seek waits
         // the same way until Play, so the frame is still here when playback resumes.
         self.seek_frame = Some(self.frame_for(index, fraction));
+        // A resume, a seek in a file that is already open, or a seek on the held
+        // row updates the place we will save. Seeking a different file that has
+        // not opened yet does not, or a failed load would replace it.
+        if self.should_remember(index) {
+            self.remember_seek(index);
+        }
+    }
+
+    fn should_remember(&self, index: usize) -> bool {
+        if self.anchor.is_none() {
+            return true;
+        }
+        if self.anchor_index().is_some_and(|(held, _)| held == index) {
+            return true;
+        }
+        self.playlist
+            .entries
+            .get(index)
+            .is_some_and(|entry| self.core.has_source(entry.source_id))
+    }
+
+    fn remember_seek(&mut self, index: usize) {
+        let Some(frame) = self.seek_frame else {
+            return;
+        };
+        let Some(segment) = self.segment(index) else {
+            return;
+        };
+        self.remember(index, frame.saturating_sub(segment.start_frame));
+    }
+
+    fn remember(&mut self, index: usize, position_frames: u64) {
+        let Some(entry) = self.playlist.entries.get(index) else {
+            return;
+        };
+        self.anchor = Some(Anchor {
+            source_id: entry.source_id,
+            segment: entry.segment,
+            position_frames,
+        });
+    }
+
+    fn anchor_index(&self) -> Option<(usize, u64)> {
+        let anchor = self.anchor.as_ref()?;
+        let index = self.playlist.entries.iter().position(|entry| {
+            entry.source_id == anchor.source_id && entry.segment == anchor.segment
+        })?;
+        Some((index, anchor.position_frames))
+    }
+
+    /// Play after a failed open. The controls are still on the held frame.
+    /// A stop with no error starts the current row from the beginning instead.
+    fn play_held(&mut self, output: &mut dyn AudioOut) -> bool {
+        if self.error.is_none() {
+            return false;
+        }
+        let Some((index, frames)) = self.anchor_index() else {
+            return false;
+        };
+        if !(self.playable(index) || self.reopen(index, true)) {
+            return false;
+        }
+        let fraction = self.fraction_at(index, frames);
+        self.error = None;
+        self.seek_fraction(index, fraction, output);
+        true
+    }
+
+    /// After a run of failed opens, the cursor is on the last file tried.
+    /// The held row is the one the controls are showing.
+    fn park_on_held(&mut self) {
+        let Some(index) = self.cursor.index() else {
+            return;
+        };
+        if self.playable(index) {
+            return;
+        }
+        let Some((held, _)) = self.anchor_index() else {
+            return;
+        };
+        self.cursor.set_index(Some(held));
+        self.display_index = Some(held);
+    }
+
+    fn fraction_at(&self, index: usize, position_frames: u64) -> f32 {
+        let frames = self.segment(index).map(|segment| segment.frames()).unwrap_or(0);
+        if frames == 0 {
+            0.0
+        } else {
+            (position_frames as f32 / frames as f32).clamp(0.0, 0.999)
+        }
+    }
+
+    /// Keep the held place in step with audio that has reached the speakers.
+    /// A decoder sitting on a file that never opened does not count.
+    fn note_located(&mut self) {
+        if let Some((index, position, _, _)) = self.locate() {
+            self.remember(index, position);
+            return;
+        }
+        if let Some((index, position, _, _)) = self.paused_seek_place() {
+            let open = self
+                .playlist
+                .entries
+                .get(index)
+                .is_some_and(|entry| self.core.has_source(entry.source_id));
+            if open {
+                self.remember(index, position);
+            }
+        }
     }
 
     fn frame_for(&self, index: usize, fraction: f32) -> u64 {
@@ -1058,7 +1208,8 @@ impl Deck {
                 seasound_model::Step::Stop => return None,
                 seasound_model::Step::To(index) => {
                     if index != current && (self.playable(index) || self.can_reopen(index, force)) {
-                        self.display_index = Some(index);
+                        // The highlight stays put until this file opens. A dead
+                        // network would otherwise walk the marker down the list.
                         self.consider_prefetch();
                         return Some(index);
                     }
@@ -1162,6 +1313,11 @@ impl Deck {
         let segment = self.segment(index)?;
         let entry = self.playlist.entries.get(index)?;
         let source = self.playlist.source(entry.source_id)?;
+        // No open decoder means this row has not played. Reporting its start
+        // would look like playback had moved there.
+        if source.error.is_some() || !self.core.has_source(entry.source_id) {
+            return None;
+        }
         let rate = source.sample_rate.max(1);
         let absolute = self.core.position().unwrap_or(segment.start_frame);
         let heard_out = self.device_played.saturating_sub(self.origin);
@@ -1187,6 +1343,14 @@ fn has_playback_timing(source: &Source, segment: usize) -> bool {
     }
 }
 
+fn idle_place(deck: &Deck, index: Option<usize>) -> (u64, u64, u32) {
+    let frames = index
+        .and_then(|index| deck.segment(index))
+        .map(|segment| segment.frames())
+        .unwrap_or(0);
+    (0, frames, deck.core.output_rate())
+}
+
 fn publish(deck: &Deck, output: &dyn AudioOut, published: &Mutex<Snapshot>) {
     // While paused, the decoder has not taken the seek yet. Report that frame so
     // the bar stays where it was moved. Playing, including a resumed start, keeps
@@ -1200,15 +1364,31 @@ fn publish(deck: &Deck, output: &dyn AudioOut, published: &Mutex<Snapshot>) {
         .or(deck.display_index)
         .or(deck.cursor.index())
         .filter(|index| *index < deck.rows.len());
-    let (position, segment_frames, rate) = located
-        .map(|(_, position, frames, rate)| (position, frames, rate))
-        .unwrap_or_else(|| {
-            let frames = index
-                .and_then(|index| deck.segment(index))
-                .map(|segment| segment.frames())
-                .unwrap_or(0);
-            (0, frames, deck.core.output_rate())
-        });
+    let anchored = deck.anchor_index();
+    let (position, segment_frames, rate) = if let Some((_, position, frames, rate)) = located {
+        (position, frames, rate)
+    } else if let Some((held, held_frames)) = anchored {
+        if index == Some(held) {
+            let frames = deck.segment(held).map(|segment| segment.frames()).unwrap_or(0);
+            let rate = deck
+                .playlist
+                .entries
+                .get(held)
+                .and_then(|entry| deck.playlist.source(entry.source_id))
+                .map(|source| source.sample_rate.max(1))
+                .unwrap_or_else(|| deck.core.output_rate());
+            let position = if frames == 0 {
+                held_frames
+            } else {
+                held_frames.min(frames.saturating_sub(1))
+            };
+            (position, frames, rate)
+        } else {
+            idle_place(deck, index)
+        }
+    } else {
+        idle_place(deck, index)
+    };
     let row = index.and_then(|index| deck.rows.get(index));
     let snapshot = Snapshot {
         state: deck.state,
@@ -1227,6 +1407,8 @@ fn publish(deck: &Deck, output: &dyn AudioOut, published: &Mutex<Snapshot>) {
         error: deck.error.clone().or_else(|| output.last_error()),
         device: output.device_name(),
         devices: Arc::new(output.devices()),
+        last_played_index: anchored.map(|(index, _)| index),
+        last_played_frames: anchored.map(|(_, frames)| frames).unwrap_or(0),
     };
     if let Ok(mut slot) = published.lock() {
         *slot = snapshot;
@@ -1593,6 +1775,147 @@ mod tests {
                     snapshot.state,
                     snapshot.error.unwrap_or_default(),
                     snapshot.index
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_failed_resume_keeps_the_place_it_started_from() {
+        let opener: Opener = Arc::new(|_source| Err(Error::new("network is not up")));
+        let engine = Engine::start_with(opener, Box::new(MemoryOutput::new(44100)));
+        let frames = 44_100 * 10;
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![
+                source("one.mp3", frames),
+                source("two.mp3", frames),
+                source("three.mp3", frames),
+                source("four.mp3", frames),
+            ]),
+            autoplay: true,
+            start: Some(StartAt {
+                index: 2,
+                fraction: 0.25,
+            }),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let settled = snapshot.rows.len() == 4
+                && snapshot.state == PlayState::Stopped
+                && snapshot.rows[2].error.is_some()
+                && snapshot.rows[3].error.is_some()
+                && snapshot.rows[0].error.is_none();
+            if settled {
+                assert_eq!(snapshot.index, Some(2), "the highlight walked off the resume row");
+                assert_eq!(snapshot.last_played_index, Some(2));
+                let expect = frames / 4;
+                let miss = snapshot.last_played_frames.abs_diff(expect);
+                assert!(
+                    miss < 2,
+                    "held {} frames, expected about {expect}",
+                    snapshot.last_played_frames
+                );
+                assert_eq!(snapshot.position_frames, snapshot.last_played_frames);
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "failures did not settle: {:?} index {:?} last {:?} {}",
+                    snapshot.state,
+                    snapshot.index,
+                    snapshot.last_played_index,
+                    snapshot.error.unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn play_retries_the_held_place_after_a_failed_open() {
+        let opener: Opener = Arc::new(|source| {
+            if source.path.ends_with("missing.flac") {
+                Err(Error::new("network is not up"))
+            } else {
+                Ok(Box::new(Ramp {
+                    len: source.presentation_frames,
+                    pos: 0,
+                }))
+            }
+        });
+        let memory = MemoryOutput::new(44100);
+        let recorded = memory.samples_handle();
+        let engine = Engine::start_with(opener, Box::new(memory));
+        let frames = 44_100 * 30;
+        engine.command(Command::SetPlaylist {
+            playlist: Playlist::new(vec![source("played.flac", frames), source("missing.flac", frames)]),
+            autoplay: true,
+            start: None,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot.last_played_index == Some(0) && recorded.lock().unwrap().len() > 8 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "first track did not play: {:?} last {:?}",
+                    snapshot.state, snapshot.last_played_index
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let held = engine.snapshot().last_played_frames;
+        engine.command(Command::PlayIndex(1));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            if snapshot.rows.get(1).and_then(|row| row.error.as_ref()).is_some()
+                && snapshot.state == PlayState::Stopped
+            {
+                assert_eq!(snapshot.index, Some(0));
+                assert_eq!(snapshot.last_played_index, Some(0));
+                assert!(snapshot.last_played_frames + 8_000 >= held);
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "missing file did not fail closed: {:?} index {:?} last {:?}",
+                    snapshot.state, snapshot.index, snapshot.last_played_index
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let place = engine.snapshot().last_played_frames;
+        let before = recorded.lock().unwrap().len();
+        engine.command(Command::TogglePause);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snapshot = engine.snapshot();
+            let heard = recorded.lock().unwrap().len();
+            if snapshot.index == Some(0)
+                && snapshot.state == PlayState::Playing
+                && snapshot.rows[0].error.is_none()
+                && heard > before
+            {
+                assert_eq!(snapshot.title, "played.flac");
+                let first_new = recorded.lock().unwrap()[before];
+                assert!(
+                    (first_new - place as f32).abs() < 8_000.0,
+                    "play started at {first_new}, held place was {place}"
+                );
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "did not return to the played track: {:?} index {:?} title {} {}",
+                    snapshot.state,
+                    snapshot.index,
+                    snapshot.title,
+                    snapshot.error.unwrap_or_default()
                 );
             }
             thread::sleep(Duration::from_millis(10));
@@ -2212,7 +2535,12 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             let samples = recorded.lock().unwrap().len();
-            if engine.snapshot().state == PlayState::Playing && samples > heard + 4 {
+            let state = engine.snapshot().state;
+            // Memory output can finish the rest of the file before this loop
+            // observes Playing. The new samples still have to start at the seek.
+            let resumed = samples > heard + 4
+                && (recorded.lock().unwrap()[heard] - target as f32).abs() < 4_000.0;
+            if resumed && (state == PlayState::Playing || state == PlayState::Stopped) {
                 break;
             }
             if std::time::Instant::now() > deadline {
