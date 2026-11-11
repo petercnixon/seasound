@@ -64,6 +64,8 @@ pub struct SeaSoundApp {
     notice: Option<String>,
     settle: u8,
     last_followed: Option<usize>,
+    /// The listener asked the playlist to show the loaded track again.
+    reveal_current: bool,
     pending_scroll: Option<f32>,
     device_pref: Option<String>,
     plugins: Vec<seasound_media::PluginStatus>,
@@ -364,6 +366,7 @@ impl SeaSoundApp {
             notice: None,
             settle: 30,
             last_followed: None,
+            reveal_current: false,
             pending_scroll: None,
             device_pref: settings.device,
             plugins,
@@ -1162,7 +1165,28 @@ impl SeaSoundApp {
                                     snap.title.clone()
                                 }
                             });
-                        ui.label(egui::RichText::new(title).strong().size(18.0));
+                        let title_text = egui::RichText::new(title).strong().size(18.0);
+                        // The playlist jumps to a track when it loads. After scrolling
+                        // away, the title brings that row back.
+                        if row.is_some() {
+                            let response = ui
+                                .add(egui::Label::new(title_text).sense(egui::Sense::click()))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("Show in playlist");
+                            if response.hovered() {
+                                let underline = response.rect;
+                                ui.painter().hline(
+                                    underline.x_range(),
+                                    underline.bottom(),
+                                    egui::Stroke::new(1.0, theme::current(ui.ctx()).accent.0),
+                                );
+                            }
+                            if response.clicked() {
+                                self.reveal_current = true;
+                            }
+                        } else {
+                            ui.label(title_text);
+                        }
                         ui.label(subtitle(row.as_ref(), &snap));
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
@@ -1333,12 +1357,14 @@ impl SeaSoundApp {
         if rows.is_empty() {
             self.forget_selection();
         }
-        if playing != self.last_followed {
-            self.last_followed = playing;
-            let lines = playlist_lines(&rows, self.file_headings);
+        let track_changed = playing != self.last_followed;
+        self.last_followed = playing;
+        if track_changed || self.reveal_current {
+            self.reveal_current = false;
             if let Some(index) = playing {
+                let lines = playlist_lines(&rows, self.file_headings);
                 if let Some(line) = line_of(&lines, &rows, index) {
-                    self.pending_scroll = Some((line as f32 * ROW_H - ROW_H * 2.0).max(0.0));
+                    self.pending_scroll = Some(reveal_offset(line));
                 }
             }
         }
@@ -2700,6 +2726,11 @@ fn batch_selected(indices: &[usize], selected: &HashSet<usize>) -> bool {
     !indices.is_empty() && indices.iter().all(|index| selected.contains(index))
 }
 
+/// Scroll offset that parks `line` two rows below the top of the playlist.
+fn reveal_offset(line: usize) -> f32 {
+    (line as f32 * ROW_H - ROW_H * 2.0).max(0.0)
+}
+
 fn line_of(lines: &[Line], rows: &[RowView], entry_index: usize) -> Option<usize> {
     lines.iter().position(|line| match line {
         Line::Track(position) => rows
@@ -3443,6 +3474,28 @@ mod tests {
         let hidden = playlist_lines(&rows, false);
         assert!(hidden.iter().all(|line| matches!(line, Line::Track(_))));
         assert_eq!(hidden.len(), 2);
+    }
+
+    #[test]
+    fn revealing_a_track_parks_it_two_rows_down() {
+        assert_eq!(reveal_offset(0), 0.0);
+        assert_eq!(reveal_offset(2), 0.0);
+        assert_eq!(reveal_offset(5), 3.0 * ROW_H);
+        let mut rows = Vec::new();
+        for index in 0..6 {
+            let group = if index == 0 {
+                Some("Album")
+            } else {
+                None
+            };
+            rows.push(row(index, group, 0, "Track"));
+        }
+        let lines = playlist_lines(&rows, true);
+        assert_eq!(line_of(&lines, &rows, 5), Some(6));
+        assert_eq!(reveal_offset(line_of(&lines, &rows, 5).unwrap()), 4.0 * ROW_H);
+        let plain = playlist_lines(&rows, false);
+        assert_eq!(line_of(&plain, &rows, 5), Some(5));
+        assert_eq!(reveal_offset(line_of(&plain, &rows, 5).unwrap()), 3.0 * ROW_H);
     }
 
     #[test]
