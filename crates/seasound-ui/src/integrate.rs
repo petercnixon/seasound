@@ -119,7 +119,8 @@ fn write_freedesktop(
     let desktop_path = data_home.join("applications/seasound.desktop");
     changed |= write_if_changed(&desktop_path, desktop.as_bytes())?;
     // GNOME Files lists applications in Open With. It does not list a desktop
-    // file's actions, so Enqueue is its own entry. NoDisplay would hide that too.
+    // file's actions, so Enqueue is its own entry. NoDisplay hides it from the
+    // app grid and still leaves it in that Open With list.
     let enqueue = enqueue_desktop_entry(exe_text, &mime);
     let enqueue_path = data_home.join("applications/seasound-enqueue.desktop");
     changed |= write_if_changed(&enqueue_path, enqueue.as_bytes())?;
@@ -182,6 +183,7 @@ Exec={enqueue}
 }
 
 /// A separate application so GNOME's Open With list can offer enqueue.
+/// `NoDisplay` keeps it out of the app grid. Files still lists it.
 /// The action on the main entry is what KDE and similar desktops show.
 fn enqueue_desktop_entry(exe: &str, mime: &str) -> String {
     let enqueue = desktop_exec(exe, " --enqueue %F");
@@ -195,6 +197,7 @@ Exec={enqueue}
 TryExec={exe}
 Icon=seasound
 Terminal=false
+NoDisplay=true
 Categories=AudioVideo;Audio;Player;
 MimeType={mime}
 StartupNotify=false
@@ -614,7 +617,7 @@ mod tests {
         assert!(enqueue.contains("Name=Enqueue in SeaSound\n"));
         assert!(enqueue.contains("Exec=\"/home/me/sea sound\" --enqueue %F\n"));
         assert!(enqueue.contains("MimeType=audio/mpeg;"));
-        assert!(!enqueue.contains("NoDisplay"));
+        assert!(enqueue.contains("NoDisplay=true\n"));
         assert!(!text.contains("inode/directory"));
         assert_eq!(
             desktop_exec("/opt/sea%sound", " %F"),
@@ -635,7 +638,8 @@ mod tests {
         let exe = Path::new("/usr/bin/seasound");
         assert!(write_freedesktop(&dir, exe, &["wv".into(), "xyz".into()], false).unwrap());
         let desktop = fs::read_to_string(dir.join("applications/seasound.desktop")).unwrap();
-        let enqueue = fs::read_to_string(dir.join("applications/seasound-enqueue.desktop")).unwrap();
+        let enqueue =
+            fs::read_to_string(dir.join("applications/seasound-enqueue.desktop")).unwrap();
         assert!(enqueue.contains("--enqueue"));
         assert!(enqueue.contains("Name=Enqueue in SeaSound"));
         assert!(desktop.contains("audio/x-wavpack"));

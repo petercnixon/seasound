@@ -74,6 +74,8 @@ pub struct SeaSoundApp {
     /// Write the open playlist file when leaving it, and again on quit.
     /// A playlist that has never been saved is still written on quit.
     auto_save_playlists: bool,
+    /// Headings above cue and chapter batches. Off until the user asks.
+    file_headings: bool,
     session: Option<SessionPlayback>,
     settings_open: bool,
     columns: ColumnLayout,
@@ -154,7 +156,8 @@ enum LoadDone {
 
 #[derive(Clone)]
 enum Line {
-    Header(String),
+    /// `position` is the first track of this batch in the row slice.
+    Header { title: String, position: usize },
     Track(usize),
 }
 
@@ -171,6 +174,9 @@ struct RowDrag {
     gesture: RowGesture,
     travel: f32,
     insert_before: Option<usize>,
+    /// A short click keeps the selection. A file heading uses this so Delete still
+    /// removes the whole batch.
+    keep_selection: bool,
 }
 
 struct CoverLookup {
@@ -218,6 +224,9 @@ struct Settings {
     /// Write an open playlist file before leaving it, and again on quit.
     #[serde(default = "default_auto_save_playlists")]
     auto_save_playlists: bool,
+    /// A heading above each contiguous batch from a cue or chapter file.
+    #[serde(default)]
+    file_headings: bool,
     /// Playlist, track, and position saved from the app. Absent when resume is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session: Option<SessionPlayback>,
@@ -263,6 +272,7 @@ impl Default for Settings {
             disabled_plugins: Vec::new(),
             resume_playback: default_resume_playback(),
             auto_save_playlists: default_auto_save_playlists(),
+            file_headings: false,
             session: None,
             columns: ColumnLayout::default(),
             theme: default_theme(),
@@ -359,6 +369,7 @@ impl SeaSoundApp {
             disabled_plugins: settings.disabled_plugins,
             resume_playback: settings.resume_playback,
             auto_save_playlists: settings.auto_save_playlists,
+            file_headings: settings.file_headings,
             session: settings.session.clone(),
             settings_open: false,
             columns: settings.columns.sanitized(),
@@ -1010,6 +1021,23 @@ impl SeaSoundApp {
                     .color(theme::current(ui.ctx()).weak_text.0),
                 );
                 ui.add_space(12.0);
+                let mut file_headings = self.file_headings;
+                if ui
+                    .checkbox(&mut file_headings, "Show file headings")
+                    .changed()
+                {
+                    self.file_headings = file_headings;
+                    self.write_settings();
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "A heading sits above the tracks from one cue or chapter file. Click it and press Delete to remove that batch. Dragging tracks apart gives each batch its own heading, and Delete removes only the tracks under the heading you clicked.",
+                    )
+                    .size(13.0)
+                    .color(theme::current(ui.ctx()).weak_text.0),
+                );
+                ui.add_space(12.0);
                 ui.label(egui::RichText::new("Output device").strong());
                 ui.add_space(6.0);
                 // A machine can list dozens of outputs, so the list scrolls instead of running off the window.
@@ -1267,7 +1295,7 @@ impl SeaSoundApp {
         }
         if playing != self.last_followed {
             self.last_followed = playing;
-            let lines = playlist_lines(&rows);
+            let lines = playlist_lines(&rows, self.file_headings);
             if let Some(index) = playing {
                 if let Some(line) = line_of(&lines, &rows, index) {
                     self.pending_scroll = Some((line as f32 * ROW_H - ROW_H * 2.0).max(0.0));
@@ -1312,7 +1340,7 @@ impl SeaSoundApp {
             }
             ui.separator();
             ui.spacing_mut().item_spacing.y = 0.0;
-            let lines = playlist_lines(&rows);
+            let lines = playlist_lines(&rows, self.file_headings);
             let scroll_style = ui.spacing().scroll;
             // Floating bars are painted over the rows. Their clicks must not select or drag.
             let bar_inset = vertical_bar_inset(
@@ -1333,11 +1361,8 @@ impl SeaSoundApp {
                 let mut slots = Vec::with_capacity(range.len());
                 for line_i in range {
                     let width = ui.available_width();
-                    let sense = match &lines[line_i] {
-                        Line::Header(_) => egui::Sense::hover(),
-                        Line::Track(_) => egui::Sense::click(),
-                    };
-                    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, ROW_H), sense);
+                    let (rect, response) =
+                        ui.allocate_exact_size(egui::vec2(width, ROW_H), egui::Sense::click());
                     slots.push(Slot {
                         line: lines[line_i].clone(),
                         rect,
@@ -1398,13 +1423,30 @@ impl SeaSoundApp {
         let mut started = false;
         if pressed {
             if let Some(pos) = pointer {
-                if let Some((position, index)) = hit_track(pos, rows, slots, bar_inset) {
+                if let Some(position) = hit_header(pos, slots, bar_inset) {
+                    let indices = group_indices(rows, position);
+                    if !indices.is_empty() {
+                        started = true;
+                        self.selected = indices.iter().copied().collect();
+                        // A short click keeps the batch. Past the slop, the heading
+                        // moves that batch and leaves any other batch of the file.
+                        self.row_drag = Some(RowDrag {
+                            gesture: RowGesture::Move {
+                                pressed: indices[0],
+                            },
+                            travel: 0.0,
+                            insert_before: None,
+                            keep_selection: true,
+                        });
+                    }
+                } else if let Some((position, index)) = hit_track(pos, rows, slots, bar_inset) {
                     started = true;
                     if self.selected.contains(&index) {
                         self.row_drag = Some(RowDrag {
                             gesture: RowGesture::Move { pressed: index },
                             travel: 0.0,
                             insert_before: None,
+                            keep_selection: false,
                         });
                     } else {
                         self.selected.clear();
@@ -1416,6 +1458,7 @@ impl SeaSoundApp {
                             },
                             travel: 0.0,
                             insert_before: None,
+                            keep_selection: false,
                         });
                     }
                 }
@@ -1461,11 +1504,13 @@ impl SeaSoundApp {
 
         self.row_drag = None;
         if drag.travel <= DRAG_SLOP {
-            let pressed_index = match drag.gesture {
-                RowGesture::Select { pressed, .. } | RowGesture::Move { pressed } => pressed,
-            };
-            self.selected.clear();
-            self.selected.insert(pressed_index);
+            if !drag.keep_selection {
+                let pressed_index = match drag.gesture {
+                    RowGesture::Select { pressed, .. } | RowGesture::Move { pressed } => pressed,
+                };
+                self.selected.clear();
+                self.selected.insert(pressed_index);
+            }
             return hover_cursor(&self.selected, rows, slots, bar_inset);
         }
         if let RowGesture::Move { .. } = drag.gesture {
@@ -1502,17 +1547,38 @@ impl SeaSoundApp {
     ) {
         let rect = slot.rect;
         let theme = theme::current(ui.ctx());
+        let moving = self.row_drag.is_some_and(|drag| {
+            drag.travel > DRAG_SLOP && matches!(drag.gesture, RowGesture::Move { .. })
+        });
         match &slot.line {
-            Line::Header(title) => {
-                ui.painter().rect_filled(rect, 0.0, theme.group_header.0);
+            Line::Header { title, position } => {
+                let indices = group_indices(rows, *position);
+                let selected = batch_selected(&indices, &self.selected);
+                let hovered = pointer_on_row(slot, bar_inset);
+                let (fill, text) = if selected {
+                    (theme.row_selected.0, theme.row_selected_text.0)
+                } else if hovered {
+                    (theme.row_hover.0, theme.row_hover_text.0)
+                } else {
+                    (theme.group_header.0, theme.group_header_text.0)
+                };
+                ui.painter().rect_filled(rect, 0.0, fill);
                 paint_text(
                     ui,
                     rect.shrink2(egui::vec2(10.0, 0.0)),
                     title,
-                    theme.group_header_text.0,
+                    text,
                     true,
                     egui::Align2::LEFT_CENTER,
                 );
+                if moving && selected {
+                    ui.painter().rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(1.0, theme.background.0),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
             Line::Track(position) => {
                 let Some(row) = rows.get(*position) else {
@@ -1520,9 +1586,6 @@ impl SeaSoundApp {
                 };
                 let playing = playing_index == Some(row.index);
                 let selected = self.selected.contains(&row.index);
-                let moving = self.row_drag.is_some_and(|drag| {
-                    drag.travel > DRAG_SLOP && matches!(drag.gesture, RowGesture::Move { .. })
-                });
                 let highlight =
                     row_highlight(&theme, playing, selected, pointer_on_row(slot, bar_inset));
                 if let Some((fill, _)) = highlight {
@@ -1841,6 +1904,7 @@ impl SeaSoundApp {
             disabled_plugins: self.disabled_plugins.clone(),
             resume_playback: self.resume_playback,
             auto_save_playlists: self.auto_save_playlists,
+            file_headings: self.file_headings,
             session: if self.resume_playback {
                 self.session.clone()
             } else {
@@ -2300,6 +2364,22 @@ fn hit_track(
     None
 }
 
+/// The file heading under the pointer. The value is the first track's row position.
+fn hit_header(pos: egui::Pos2, slots: &[Slot], bar_inset: f32) -> Option<usize> {
+    for slot in slots {
+        if !slot.response.contains_pointer() {
+            continue;
+        }
+        if !row_hit_rect(slot.rect, bar_inset).contains(pos) {
+            continue;
+        }
+        if let Line::Header { position, .. } = &slot.line {
+            return Some(*position);
+        }
+    }
+    None
+}
+
 fn track_spans(rows: &[RowView], slots: &[Slot]) -> Vec<TrackSpan> {
     let mut spans = Vec::new();
     for slot in slots {
@@ -2356,11 +2436,14 @@ fn hover_cursor(
         if !pointer_on_row(slot, bar_inset) {
             return false;
         }
-        let Line::Track(position) = &slot.line else {
-            return false;
-        };
-        rows.get(*position)
-            .is_some_and(|row| selected.contains(&row.index))
+        match &slot.line {
+            Line::Track(position) => rows
+                .get(*position)
+                .is_some_and(|row| selected.contains(&row.index)),
+            Line::Header { position, .. } => {
+                batch_selected(&group_indices(rows, *position), selected)
+            }
+        }
     });
     if hover {
         Some(egui::CursorIcon::Grab)
@@ -2520,15 +2603,46 @@ fn row_highlight(
     Some((fill.0, text.0))
 }
 
-fn playlist_lines(rows: &[RowView]) -> Vec<Line> {
+fn playlist_lines(rows: &[RowView], headings: bool) -> Vec<Line> {
     let mut lines = Vec::new();
     for (position, row) in rows.iter().enumerate() {
-        if let Some(title) = &row.group {
-            lines.push(Line::Header(title.clone()));
+        if headings {
+            if let Some(title) = &row.group {
+                lines.push(Line::Header {
+                    title: title.clone(),
+                    position,
+                });
+            }
         }
         lines.push(Line::Track(position));
     }
     lines
+}
+
+/// Playlist indices under the heading on `position`.
+///
+/// The batch is the contiguous run of that file, starting at the heading's first track.
+/// A later heading for the same file, after the tracks were dragged apart, is a separate
+/// batch and is not included.
+fn group_indices(rows: &[RowView], position: usize) -> Vec<usize> {
+    let Some(start) = rows.get(position) else {
+        return Vec::new();
+    };
+    if start.group.is_none() {
+        return Vec::new();
+    }
+    let mut indices = Vec::new();
+    for row in rows.iter().skip(position) {
+        if row.source_id != start.source_id {
+            break;
+        }
+        indices.push(row.index);
+    }
+    indices
+}
+
+fn batch_selected(indices: &[usize], selected: &HashSet<usize>) -> bool {
+    !indices.is_empty() && indices.iter().all(|index| selected.contains(index))
 }
 
 fn line_of(lines: &[Line], rows: &[RowView], entry_index: usize) -> Option<usize> {
@@ -2536,7 +2650,7 @@ fn line_of(lines: &[Line], rows: &[RowView], entry_index: usize) -> Option<usize
         Line::Track(position) => rows
             .get(*position)
             .is_some_and(|row| row.index == entry_index),
-        Line::Header(_) => false,
+        Line::Header { .. } => false,
     })
 }
 
@@ -3260,11 +3374,59 @@ mod tests {
             row(0, Some("Dark Side"), 0, "Speak to Me"),
             row(1, None, 44100, "Breathe"),
         ];
-        let lines = playlist_lines(&rows);
-        assert!(matches!(lines[0], Line::Header(_)));
+        let lines = playlist_lines(&rows, true);
+        assert!(matches!(
+            lines[0],
+            Line::Header {
+                position: 0,
+                ..
+            }
+        ));
         assert!(matches!(lines[1], Line::Track(0)));
         assert!(matches!(lines[2], Line::Track(1)));
         assert_eq!(line_of(&lines, &rows, 1), Some(2));
+        let hidden = playlist_lines(&rows, false);
+        assert!(hidden.iter().all(|line| matches!(line, Line::Track(_))));
+        assert_eq!(hidden.len(), 2);
+    }
+
+    #[test]
+    fn a_heading_selects_one_batch_when_the_file_was_split() {
+        let mut rows = vec![
+            row(10, Some("Album"), 0, "One"),
+            row(11, None, 1000, "Two"),
+            row(4, None, 0, "Interlude"),
+            row(12, Some("Album"), 2000, "Three"),
+        ];
+        rows[2].source_id = SourceId(9);
+        assert_eq!(group_indices(&rows, 0), vec![10, 11]);
+        assert_eq!(group_indices(&rows, 3), vec![12]);
+        assert!(group_indices(&rows, 2).is_empty());
+        assert!(group_indices(&rows, 9).is_empty());
+        let lines = playlist_lines(&rows, true);
+        assert!(matches!(
+            &lines[0],
+            Line::Header {
+                title,
+                position: 0,
+            } if title == "Album"
+        ));
+        assert!(matches!(
+            &lines[4],
+            Line::Header {
+                title,
+                position: 3,
+            } if title == "Album"
+        ));
+        let first = group_indices(&rows, 0);
+        let mut selected = HashSet::new();
+        for index in &first {
+            selected.insert(*index);
+        }
+        assert!(batch_selected(&first, &selected));
+        assert!(!batch_selected(&group_indices(&rows, 3), &selected));
+        selected.insert(4);
+        assert!(batch_selected(&first, &selected));
     }
 
     #[test]
@@ -3746,6 +3908,7 @@ mod tests {
         let parsed: Settings = serde_json::from_str(r#"{"volume":0.4,"muted":true}"#).unwrap();
         assert!(parsed.resume_playback);
         assert!(parsed.auto_save_playlists);
+        assert!(!parsed.file_headings);
         assert!(parsed.session.is_none());
         assert!((parsed.volume - 0.4).abs() < f32::EPSILON);
         let session = SessionPlayback {
@@ -3787,6 +3950,13 @@ mod tests {
         let manual_back: Settings =
             serde_json::from_str(&serde_json::to_string(&manual).unwrap()).unwrap();
         assert!(!manual_back.auto_save_playlists);
+        let headings = Settings {
+            file_headings: true,
+            ..Settings::default()
+        };
+        let headings_back: Settings =
+            serde_json::from_str(&serde_json::to_string(&headings).unwrap()).unwrap();
+        assert!(headings_back.file_headings);
         let dir = PathBuf::from("/tmp/seasound-config");
         let open = PathBuf::from("/music/album.json");
         assert_eq!(
