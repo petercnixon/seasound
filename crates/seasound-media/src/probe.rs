@@ -859,6 +859,15 @@ struct Tags {
     cover: Option<Cover>,
 }
 
+/// Embedded cover image, without decoding audio.
+///
+/// FLAC and the other tagged formats use the first picture lofty finds.
+/// M4A, M4B, and MP4 use that picture, or the `covr` atom when lofty has none.
+/// A full probe stores this same image on [`Source::cover`].
+pub fn read_cover(path: &Path) -> Option<Cover> {
+    read_tags(path).cover
+}
+
 fn read_tags(path: &Path) -> Tags {
     let mut tags = Tags {
         title: String::new(),
@@ -1048,6 +1057,61 @@ mod tests {
             false
         });
         assert_eq!(first_only, vec![missing_a]);
+    }
+
+    #[test]
+    fn missing_file_has_no_cover() {
+        assert!(read_cover(Path::new("/no/such/seasound-cover.flac")).is_none());
+    }
+
+    #[test]
+    fn flac_picture_matches_the_probe() {
+        let Some(examples) = examples() else {
+            return;
+        };
+        let path = examples.join("George Formby - The War and Postwar Years CD1.flac");
+        if !path.is_file() {
+            return;
+        }
+        let cover = read_cover(&path).expect("flac picture");
+        let probed = probe_file(&path);
+        let from_probe = probed.cover.expect("probe picture");
+        assert_eq!(cover.mime, "image/jpeg");
+        assert_eq!(cover, from_probe);
+        assert!(cover.bytes.starts_with(&[0xff, 0xd8]));
+    }
+
+    #[test]
+    fn m4a_covr_uses_the_same_read_as_a_probe() {
+        let Some(examples) = examples() else {
+            return;
+        };
+        let source = examples.join("HE-AAC/SBRtestStereoAot5Sig1.mp4");
+        if !source.is_file() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "seasound-m4a-art-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chapter.m4a");
+        std::fs::copy(&source, &path).unwrap();
+        assert!(read_cover(&path).is_none());
+        let jpeg = vec![0xff, 0xd8, 0xff, 0xd9];
+        let mut tag = mp4ameta::Tag::read_from_path(&path).expect("m4a tag");
+        tag.set_artwork(mp4ameta::Img::jpeg(jpeg.clone()));
+        tag.write_to_path(&path).expect("write covr");
+        let cover = read_cover(&path).expect("covr");
+        assert_eq!(cover.mime, "image/jpeg");
+        assert_eq!(cover.bytes, jpeg);
+        let probed = probe_file(&path).cover.expect("probe covr");
+        assert_eq!(probed, cover);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

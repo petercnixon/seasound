@@ -37,6 +37,10 @@ pub struct SeaSoundApp {
     selected: HashSet<usize>,
     row_drag: Option<RowDrag>,
     covers: HashMap<SourceId, Cover>,
+    /// Files whose picture was already taken from a probe, or looked up and found empty.
+    cover_known: HashSet<SourceId>,
+    /// One file being opened for its picture. Playback does not wait on this.
+    cover_lookup: Option<CoverLookup>,
     warnings: HashMap<SourceId, String>,
     textures: HashMap<SourceId, egui::TextureHandle>,
     cover_failed: HashSet<SourceId>,
@@ -150,6 +154,11 @@ struct RowDrag {
     gesture: RowGesture,
     travel: f32,
     insert_before: Option<usize>,
+}
+
+struct CoverLookup {
+    id: SourceId,
+    rx: Receiver<Option<Cover>>,
 }
 
 struct Slot {
@@ -297,6 +306,8 @@ impl SeaSoundApp {
             selected: HashSet::new(),
             row_drag: None,
             covers: HashMap::new(),
+            cover_known: HashSet::new(),
+            cover_lookup: None,
             warnings: HashMap::new(),
             textures: HashMap::new(),
             cover_failed: HashSet::new(),
@@ -354,6 +365,8 @@ impl SeaSoundApp {
             // The previous list stays out of the way while the new one is read.
             self.engine.command(Command::Clear);
             self.covers.clear();
+            self.cover_known.clear();
+            self.cover_lookup = None;
             self.warnings.clear();
             self.textures.clear();
             self.cover_failed.clear();
@@ -402,7 +415,7 @@ impl SeaSoundApp {
                 position,
             } => {
                 let start = resume_start(&playlist, &position);
-                self.install_playlist(playlist, false, path, start);
+                self.install_playlist(playlist, false, path, start, true);
                 self.priority_started = true;
                 self.loading = true;
                 self.settle = 30;
@@ -451,7 +464,7 @@ impl SeaSoundApp {
                             let start = position
                                 .as_ref()
                                 .and_then(|position| resume_start(&playlist, position));
-                            self.install_playlist(playlist, false, Some(path), start);
+                            self.install_playlist(playlist, false, Some(path), start, false);
                         }
                     }
                     LoadDone::Session { playlist, session } => {
@@ -462,7 +475,7 @@ impl SeaSoundApp {
                                 .track
                                 .as_ref()
                                 .and_then(|track| resume_start(&playlist, track));
-                            self.install_playlist(playlist, false, None, start);
+                            self.install_playlist(playlist, false, None, start, false);
                         }
                     }
                 }
@@ -473,6 +486,7 @@ impl SeaSoundApp {
     fn append_sources(&mut self, sources: Vec<Source>) {
         let mut extra = Playlist::new(sources);
         let (covers, warnings) = take_art(&mut extra);
+        self.mark_covers_read(&extra);
         self.covers.extend(covers);
         self.warnings.extend(warnings);
         self.engine.command(Command::Append(extra));
@@ -502,6 +516,8 @@ impl SeaSoundApp {
         self.priority_started = false;
         self.engine.command(Command::Clear);
         self.covers.clear();
+        self.cover_known.clear();
+        self.cover_lookup = None;
         self.warnings.clear();
         self.textures.clear();
         self.cover_failed.clear();
@@ -525,10 +541,16 @@ impl SeaSoundApp {
         autoplay: bool,
         path: Option<PathBuf>,
         start: Option<StartAt>,
+        covers_read: bool,
     ) {
         let (covers, warnings) = take_art(&mut playlist);
         let repeat = self.snap.repeat;
         let shuffle = self.snap.shuffle;
+        self.cover_known.clear();
+        self.cover_lookup = None;
+        if covers_read {
+            self.mark_covers_read(&playlist);
+        }
         self.engine.command(Command::SetPlaylist {
             playlist,
             autoplay,
@@ -553,6 +575,7 @@ impl SeaSoundApp {
     /// Add the files that finished reading. The track already playing keeps its decoder.
     fn complete_playlist(&mut self, mut playlist: Playlist) {
         let (covers, warnings) = take_art(&mut playlist);
+        self.mark_covers_read(&playlist);
         self.covers.extend(covers);
         self.warnings.extend(warnings);
         self.engine.command(Command::ReplacePlaylist(playlist));
@@ -1514,6 +1537,56 @@ impl SeaSoundApp {
         paint_ghost(ctx, pointer, &label);
     }
 
+    fn mark_covers_read(&mut self, playlist: &Playlist) {
+        for source in &playlist.sources {
+            self.cover_known.insert(source.id);
+        }
+    }
+
+    /// Store a picture that finished loading, then ask for the file that is current.
+    fn poll_cover(&mut self) {
+        let lookup = match self.cover_lookup.as_ref() {
+            Some(lookup) => lookup,
+            None => return,
+        };
+        let cover = match lookup.rx.try_recv() {
+            Ok(cover) => cover,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        let id = lookup.id;
+        self.cover_lookup = None;
+        self.cover_known.insert(id);
+        if let Some(cover) = cover {
+            if !cover.bytes.is_empty() {
+                self.covers.insert(id, cover);
+                self.cover_failed.remove(&id);
+                self.settle = self.settle.max(8);
+            }
+        }
+    }
+
+    fn request_playing_cover(&mut self) {
+        let Some(row) = current_row(&self.snap) else {
+            return;
+        };
+        let id = row.source_id;
+        if !needs_cover_read(
+            id,
+            &self.cover_known,
+            self.covers.contains_key(&id),
+            self.cover_lookup.is_some(),
+        ) {
+            return;
+        }
+        let path = row.path.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(seasound_media::read_cover(&path));
+        });
+        self.cover_lookup = Some(CoverLookup { id, rx });
+    }
+
     fn ensure_cover(&mut self, ctx: &egui::Context, id: SourceId) {
         if self.textures.contains_key(&id) || self.cover_failed.contains(&id) {
             return;
@@ -1747,6 +1820,8 @@ impl eframe::App for SeaSoundApp {
             self.persist();
         }
         self.poll_load();
+        self.poll_cover();
+        self.request_playing_cover();
         self.take_drops(ctx);
         self.handle_keys(ctx);
         self.retitle(ctx);
@@ -1756,6 +1831,7 @@ impl eframe::App for SeaSoundApp {
         self.settings_window(ctx);
         self.arm_dialog(ctx);
         if self.loading
+            || self.cover_lookup.is_some()
             || self.snap.state == PlayState::Playing
             || self.settle > 0
             || self.dialog.is_some()
@@ -1883,6 +1959,8 @@ fn load_saved_rows(
     session: bool,
     tx: &mpsc::Sender<LoadEvent>,
 ) {
+    // Timing is already in the file, so playback can start without opening every row.
+    // The picture is not stored. The window reads it once the current row is known.
     if let Some(playlist) = playlist_from_descriptions(&saved.rows) {
         let finished = if session {
             LoadDone::Session {
@@ -2018,6 +2096,19 @@ fn resume_start(playlist: &Playlist, track: &SavedPosition) -> Option<StartAt> {
     };
     let index = rows.get(position).map(|row| row.index)?;
     Some(StartAt { index, fraction })
+}
+
+/// True when the current file still needs its embedded picture read.
+/// A probe already stored the image, or stored that there is none. A playlist
+/// rebuilt from saved rows has neither, so the file that is playing is opened
+/// for the picture alone. `busy` keeps that to one file at a time.
+fn needs_cover_read(
+    id: SourceId,
+    known: &HashSet<SourceId>,
+    have_bytes: bool,
+    busy: bool,
+) -> bool {
+    !busy && !have_bytes && !known.contains(&id)
 }
 
 fn take_art(playlist: &mut Playlist) -> (HashMap<SourceId, Cover>, HashMap<SourceId, String>) {
@@ -3047,6 +3138,32 @@ mod tests {
         };
         assert_eq!(playback_position(&snap), back.position);
         assert!(playback_position(&Snapshot::default()).is_none());
+    }
+
+    #[test]
+    fn a_described_playlist_still_needs_the_playing_file_read_for_art() {
+        let row = SavedRow {
+            path: PathBuf::from("/music/album.flac"),
+            start_frame: 0,
+            end_frame: 1000,
+            title: "Chapter".into(),
+            sample_rate: 44100,
+            channels: 2,
+            presentation_frames: 1000,
+            number: 1,
+            format_name: "FLAC".into(),
+            ..SavedRow::default()
+        };
+        let playlist = playlist_from_descriptions(&[row]).expect("described");
+        let id = playlist.sources[0].id;
+        assert!(playlist.sources[0].cover.is_none());
+        let known = HashSet::new();
+        assert!(needs_cover_read(id, &known, false, false));
+        assert!(!needs_cover_read(id, &known, true, false));
+        assert!(!needs_cover_read(id, &known, false, true));
+        let mut known = HashSet::new();
+        known.insert(id);
+        assert!(!needs_cover_read(id, &known, false, false));
     }
 
     #[test]

@@ -14,7 +14,7 @@ mod probe;
 
 pub use decode::open_decoder;
 pub use plugins::{install_plugins, plugin_extensions, plugin_statuses, set_plugin_enabled, PluginStatus};
-pub use probe::{load_paths, load_paths_each, probe_file};
+pub use probe::{load_paths, load_paths_each, probe_file, read_cover};
 
 pub use chapters::segments_from_chapters;
 pub use cue::{parse_cue_text, segments_from_cue};
