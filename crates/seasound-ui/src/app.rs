@@ -25,6 +25,8 @@ const DRAG_SLOP: f32 = 8.0;
 const AUDIO_EXT: &[&str] = &[
     "mp3", "flac", "m4a", "m4b", "mp4", "wav", "aiff", "aif", "ogg", "cue", "m3u", "m3u8",
 ];
+/// SeaSound playlist. Not `.spl` (Windows print spool) or `.spf` (several other formats).
+const PLAYLIST_EXT: &str = "sspl";
 
 pub struct SeaSoundApp {
     engine: Engine,
@@ -306,10 +308,11 @@ impl SeaSoundApp {
             let _ = std::fs::create_dir_all(dir);
         }
         let settings_path = config_dir.as_ref().map(|dir| dir.join("settings.json"));
-        let settings = settings_path
+        let mut settings = settings_path
             .as_ref()
             .map(|path| load_settings(path))
             .unwrap_or_default();
+        settings.playlist = adopt_playlist_extension(config_dir.as_deref(), settings.playlist);
         let volume = settings.volume.clamp(0.0, 1.0);
         let themes_dir = config_dir.as_ref().map(|dir| dir.join("themes"));
         if let Some(dir) = &themes_dir {
@@ -1899,7 +1902,7 @@ impl SeaSoundApp {
             }
             Dialog::OpenPlaylist => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Playlist", &["json"])
+                    .add_filter("Playlist", &[PLAYLIST_EXT, "json"])
                     .pick_file()
                 {
                     self.flush_open_playlist();
@@ -1911,8 +1914,8 @@ impl SeaSoundApp {
             }
             Dialog::SavePlaylist => {
                 let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Playlist", &["json"])
-                    .set_file_name("playlist.json");
+                    .add_filter("Playlist", &[PLAYLIST_EXT])
+                    .set_file_name("playlist.sspl");
                 if let Some(path) = &self.playlist_path {
                     if let Some(parent) = path.parent() {
                         dialog = dialog.set_directory(parent);
@@ -1922,7 +1925,7 @@ impl SeaSoundApp {
                     }
                 }
                 if let Some(path) = dialog.save_file() {
-                    let path = ensure_json(path);
+                    let path = ensure_playlist_extension(path);
                     if self.playlist_path.as_ref() != Some(&path) {
                         self.flush_open_playlist();
                     }
@@ -2035,7 +2038,7 @@ impl SeaSoundApp {
 
 /// Where quit writes the playlist.
 /// An open file is written only when auto-save is on.
-/// A playlist that was never saved still goes to `playlist.json`.
+/// A playlist that was never saved still goes to `playlist.sspl`.
 fn quit_playlist_path(
     auto_save: bool,
     open: Option<&Path>,
@@ -2047,7 +2050,43 @@ fn quit_playlist_path(
         }
         return None;
     }
-    config_dir.map(|dir| dir.join("playlist.json"))
+    config_dir.map(default_playlist_path)
+}
+
+fn default_playlist_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("playlist.sspl")
+}
+
+fn legacy_default_playlist_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("playlist.json")
+}
+
+/// The config-directory playlist used to be `playlist.json`.
+/// When settings still name that file, rename it to `playlist.sspl`.
+/// A playlist the user saved under another name is left as it is.
+fn adopt_playlist_extension(
+    config_dir: Option<&Path>,
+    playlist: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let Some(dir) = config_dir else {
+        return playlist;
+    };
+    let legacy = legacy_default_playlist_path(dir);
+    let current = default_playlist_path(dir);
+    match playlist {
+        Some(path) if path == legacy => {
+            rename_legacy_playlist(&legacy, &current);
+            Some(current)
+        }
+        other => other,
+    }
+}
+
+fn rename_legacy_playlist(legacy: &Path, current: &Path) {
+    if current.exists() || !legacy.is_file() {
+        return;
+    }
+    let _ = std::fs::rename(legacy, current);
 }
 
 impl eframe::App for SeaSoundApp {
@@ -3343,9 +3382,9 @@ fn load_settings(path: &Path) -> Settings {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
-fn ensure_json(mut path: PathBuf) -> PathBuf {
+fn ensure_playlist_extension(mut path: PathBuf) -> PathBuf {
     if path.extension().is_none() {
-        path.set_extension("json");
+        path.set_extension(PLAYLIST_EXT);
     }
     path
 }
@@ -4096,13 +4135,59 @@ mod tests {
         assert_eq!(quit_playlist_path(false, Some(&open), Some(&dir)), None);
         assert_eq!(
             quit_playlist_path(false, None, Some(&dir)),
-            Some(dir.join("playlist.json"))
+            Some(dir.join("playlist.sspl"))
         );
         assert_eq!(
             quit_playlist_path(true, None, Some(&dir)),
-            Some(dir.join("playlist.json"))
+            Some(dir.join("playlist.sspl"))
         );
         assert_eq!(quit_playlist_path(false, None, None), None);
+        assert_eq!(
+            ensure_playlist_extension(PathBuf::from("/music/night")),
+            PathBuf::from("/music/night.sspl")
+        );
+        assert_eq!(
+            ensure_playlist_extension(PathBuf::from("/music/night.sspl")),
+            PathBuf::from("/music/night.sspl")
+        );
+        assert_eq!(
+            ensure_playlist_extension(PathBuf::from("/music/album.json")),
+            PathBuf::from("/music/album.json")
+        );
+    }
+
+    #[test]
+    fn the_config_playlist_json_is_renamed_to_sspl() {
+        let dir = std::env::temp_dir().join(format!(
+            "seasound-sspl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("playlist.json");
+        let current = dir.join("playlist.sspl");
+        std::fs::write(&legacy, "{\"version\":1,\"rows\":[]}").unwrap();
+        let adopted = adopt_playlist_extension(Some(&dir), Some(legacy.clone())).unwrap();
+        assert_eq!(adopted, current);
+        assert!(current.is_file());
+        assert!(!legacy.exists());
+        std::fs::write(&legacy, "{\"version\":1,\"rows\":[]}").unwrap();
+        let kept = adopt_playlist_extension(Some(&dir), Some(legacy.clone())).unwrap();
+        assert_eq!(kept, current);
+        assert!(legacy.is_file());
+        let elsewhere = PathBuf::from("/music/album.json");
+        assert_eq!(
+            adopt_playlist_extension(Some(&dir), Some(elsewhere.clone())),
+            Some(elsewhere)
+        );
+        assert_eq!(
+            adopt_playlist_extension(None, Some(legacy.clone())),
+            Some(legacy)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
